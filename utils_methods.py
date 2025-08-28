@@ -3,6 +3,7 @@ import math
 import random
 
 from Universal_Attention.universal_attention import UniversalAttention
+from Universal_Attention.triton.universal_attention_kernel_opt import _attention
 # import numpy as np
 
 # set random seed
@@ -38,7 +39,6 @@ def blockwise_ua_test_harness(
     values: torch.Tensor, # b,h,l,d
     static_src: torch.Tensor, # b,h,l
     static_dest: torch.Tensor, # b,h,l
-    method: str = 'slow',
     chunk_size: int = 128,
 ):
     batch_size, nheads, q_len, emb_kq_per_head = queries.shape
@@ -136,9 +136,41 @@ def blockwise_ua_test_harness(
     # xq: b h r _n _c d
     # static_src: b h n_ c_
     # static_dest: b h _n _c
-    if method == 'slow':
-        output, denom = UniversalAttention.apply(
-            kc, vc, queries, static_src, static_dest
-        )
+    output, denom = UniversalAttention.apply(
+        kc, vc, queries, static_src, static_dest
+    )
 
     return output, denom
+
+# - it runs the optimized 
+def blockwise_ua_test_harness2(
+    queries: torch.Tensor, # b,h,l,d
+    keys: torch.Tensor, # b,h,l,d
+    values: torch.Tensor, # b,h,l,d
+    static_src: torch.Tensor, # b,h,l
+    static_dest: torch.Tensor, # b,h,l
+):
+    # batch_size, nheads, q_len, emb_kq_per_head = queries.shape
+    # batch_size, kvheads, _, _ = keys.shape
+    # _, _, _, emb_v_per_head = values.shape
+
+    # need to do this because the kernel has some wierd hacks
+    static_src.requires_grad_()
+    static_dest.requires_grad_()
+
+    # sigmoid the statics
+    static_src = static_src.sigmoid() # step decay
+    static_dest = static_dest.sigmoid() # step decay
+
+    # Normalize keys
+    keys = keys / keys.pow(2).sum(-1, True).sqrt().add(1e-6)
+
+    output = _attention.apply(
+        queries,
+        keys,
+        values,
+        True, 1.0, 
+        static_src,
+        static_dest,
+    )
+    return output, None

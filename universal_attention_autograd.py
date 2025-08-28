@@ -1,6 +1,50 @@
 import torch
 from torch.autograd import Function
 
+# this is the simplest implementation that does not require any loops
+# - it doesnt even need to be in an AutoGrad function, since torch ops
+#  will know how to build the autograd graph.
+def simplest_implementation(
+    q: torch.Tensor, # b,h,l,d
+    k: torch.Tensor, # b,h,l,d
+    v: torch.Tensor, # b,h,l,d
+    static_src: torch.Tensor,
+    static_dest: torch.Tensor,
+):
+
+    #
+    _, _, l, _ = q.shape
+    
+    # L2-normalize K
+    k = k/k.pow(2).sum(-1,True).sqrt().add(1e-6)
+    
+    # Compute decay mask
+    affinity = (
+        k.matmul(k.transpose(-1,-2)).relu().pow(2) # deltanet-style decay
+        * static_src.unsqueeze(-1).sigmoid() # step decay
+        * static_dest.unsqueeze(-2).sigmoid() # step decay
+    ).pow(
+        1/3 # aggregate the 3 types of decays by geometric mean
+    )
+    affinity = 1 - affinity # affinity = 1 - decay
+    decay = affinity.masked_fill(
+        torch.ones(l,l, device=k.device).tril().bool(),
+        1  # over the seq dimenstion
+    ).cumprod(
+        3  # weights prod
+    ).masked_fill(
+        torch.ones(l,l, device=k.device).tril(-1).bool(),
+        0
+    )
+    
+    # Compute softmax attention
+    logits = k.matmul(q.transpose(-1,-2)).add(decay.log())
+    denom = logits.logsumexp(dim=-2)
+    score = logits.sub(denom.unsqueeze(-2))
+    targ = score.exp().transpose(-1,-2).matmul(v)
+    # return decay
+    return targ, denom
+
 # The pytorch autograd version is borrowed from here: 
 # https://github.com/daviswer/torchtitan/blob/sandbox-selfprune-clean-wd/torchtitan/models/llama/utils.py
 

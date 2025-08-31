@@ -38,18 +38,24 @@ def parallelizeable_implementation(
 
     # can be compute in parallel using
     # l / chunks_size instances
-    # - memory O(l^2 / chunk_size)
     chunked_decay = torch.empty(
         b, h, l // chunk_size, l,
         device=q.device
     )
     for i in range(0, l // chunk_size):  
+
+        # - compute the mask for the chunked rows
         mask = (
             torch.arange(
                 i*chunk_size,(i+1)*chunk_size,
             ).unsqueeze(-1) <= 
             torch.arange(l).unsqueeze(-2) 
         ).to(q.device)
+
+        # - compute the delay, product across the chunk
+        # - we only need the final prod, do not
+        #   need to store all O(l/chunk_size) forws
+        #   of delay values
         decay = compute_decay(
             k[
                 ..., 
@@ -64,19 +70,23 @@ def parallelizeable_implementation(
             ],
         ).masked_fill(
             mask, 1
-        ).prod(-2) # 
+        ).prod(-2) # we only need the final prod
 
         # store the chunked delay
         chunked_decay[...,i,:] = decay
 
     # pass the chunked decay
+    # - similar to mamba state passing
     chunked_decay = chunked_decay.cumprod(-2)
 
-    # can be compute in parallel using
+    # can be computed in parallel using
     # l / chunks_size instances
 
     targ = torch.empty(b,h,l,d)
     for i in range(0, l // chunk_size):  
+
+        # - compute the delay across the chunked rows
+        # - this can be fused as we recompute the delay
         decay = compute_decay(
             k[
                 ..., 
@@ -91,30 +101,34 @@ def parallelizeable_implementation(
             ],
         )
 
-
-        # with strict < to the the upper triangular
+        # - part of recomputation: chunk mask
         mask = (
             torch.arange(
                 i*chunk_size,(i+1)*chunk_size,
             ).unsqueeze(-1) <= 
             torch.arange(l).unsqueeze(-2) 
         ).to(q.device)
-        mask2 = (
-            torch.arange(
-                i*chunk_size,(i+1)*chunk_size,
-            ).unsqueeze(-1) <
-            torch.arange(l).unsqueeze(-2) 
-        ).to(q.device)
+
+        # recomputation: cumprod
         decay = decay.masked_fill(
             mask, 1
         ).cumprod(
             -2
         )
 
-        # prod the boundary
+        # take into account the chunked boundary
+        # conditions
         if i > 0:
             decay *= chunked_decay[...,i-1:i,:]
 
+        # - the the causal delay values
+        # with strict < to the the upper triangular
+        mask2 = (
+            torch.arange(
+                i*chunk_size,(i+1)*chunk_size,
+            ).unsqueeze(-1) <
+            torch.arange(l).unsqueeze(-2) 
+        ).to(q.device)
         decay = decay.masked_fill(mask2, 0)
 
         # get the row-chunked logits
@@ -135,18 +149,3 @@ def parallelizeable_implementation(
         ] = score.exp().matmul(v)
 
     return targ
-
-    # b, h, 
-    q = q.view(b, h, lq // chunk_size, chunk_size, d)
-    k = k.view(b, h, lk // chunk_size, chunk_size, d)
-
-    # Compute decay values
-    decay = 1 - (
-        k.matmul(k.transpose(-1,-2)).relu().pow(2) # deltanet-style decay
-        * static_src.unsqueeze(-1).sigmoid() # step decay
-        * static_dest.unsqueeze(-2).sigmoid() # step decay
-    ).pow(
-        1/3 # aggregate the 3 types of decays by geometric mean
-    )
-
-

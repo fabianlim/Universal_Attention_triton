@@ -511,6 +511,8 @@ def _softmax_with_decay_fwd(
             )
 
         if res_decay:
+            # NOTE: also consider returning score + delay
+            # if the user wants to inspect the values
             tl.store(
                 (
                     res_decay 
@@ -535,19 +537,21 @@ def _softmax_with_decay_fwd(
             score_max, 
             tl.max(score, axis=1) , 
         ) # m_i
-        alpha = (
+        score_denom_corrected = (
             score_denom_prev * 
-            tl.math.exp(
+            tl.exp(
                 score_max_prev - score_max
             ) 
         ) # d_{i-1} * exp(m_{i-1} - m_i)
-        weights = tl.math.exp(
+        weights = tl.exp(
             score - score_max[:, None]
         ) # exp(q^T k - m_i)
 
+        # - update score denom
         # d_i = d_{i-1} * exp(m_{i-1} - m_i) + \sum_{j} exp(q^T k - m_i)
-        score_denom *= alpha
-        score_denom += tl.sum(weights, axis=1)
+        score_denom = (
+            score_denom_corrected + tl.sum(weights, axis=1)
+        )
 
         v_mat = tl.load(
             (
@@ -559,9 +563,9 @@ def _softmax_with_decay_fwd(
             other=0.0
         )
 
-        # o_{i-1} * d_i * exp(m_{i-1} - m_i) / d_{i-1}
+        # o_{i-1} * d_{i-1} * exp(m_{i-1} - m_i) / d_i
         # +  \sum_{j} exp(q^T k - m_i) / d_i *  V[j]
-        acc *= (alpha / score_denom)[:, None]
+        acc *= (score_denom_corrected / score_denom)[:, None]
         acc += tl.dot(
             weights / score_denom[:, None],
             v_mat
@@ -575,7 +579,7 @@ def _softmax_with_decay_fwd(
         # handle the limit
         limit_c -= BLOCK_C
 
-    # - 
+    # -  DONE WITH COL CHUNK LOOPS - 
 
     tl.store(
         (

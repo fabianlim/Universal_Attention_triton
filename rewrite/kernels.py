@@ -233,12 +233,8 @@ def softmax_with_decay_fwd(
     _, _, _, vdim = v.shape
     assert qlen == klen
     assert nheads % kvheads == 0
+    assert qdim == vdim
 
-    # grid = lambda META: (
-    #     b, 
-    #     nheads, 
-    #     triton.cdiv(qlen, META['BLOCK_SIZE_M'])
-    # )
     grid = (b, nheads, triton.cdiv(qlen, chunk_size))
 
     # NOTE: move this somewhere?
@@ -338,6 +334,8 @@ def _softmax_with_decay_fwd(
 
     # keys (row) and dest will be offset by chunk
     keys_r = keys + pid_r * chunk_size * k_stride_seq
+    queries_r = queries + pid_r * chunk_size * q_stride_seq
+    res_r = res + pid_r * chunk_size * res_stride_seq
     dest += pid_r * chunk_size * dest_stride_seq
 
     if res_decay:
@@ -345,10 +343,6 @@ def _softmax_with_decay_fwd(
         res_decay += pid_r * chunk_size * res_decay_stride_qseq
 
     # decay offset by chunk index
-    # if pid_r == 0:
-    #     # NOTE: decay is only needed for rows > 0
-    #     decay_prev = False
-    # else:
     decay_prev_chunk = chunked_decay # Need to set this otherwise I cannot
     if pid_r > 0:
         # get the previous row
@@ -356,9 +350,11 @@ def _softmax_with_decay_fwd(
         decay_prev_chunk += (pid_r-1) * d_stride_chunk
 
     # online-softmax accumulation elements
-    m_i = tl.zeros([chunk_size], dtype=tl.float32) - float("inf")
-    l_i = tl.zeros([chunk_size], dtype=tl.float32) + 1.0
-    acc = tl.zeros([chunk_size, BLOCK_D], dtype=tl.float32)
+    score_max = tl.zeros([chunk_size], dtype=tl.float32) - float("inf")
+    score_denom = tl.zeros([chunk_size], dtype=tl.float32) + 1.0
+    # TODO: its not gauranteed that value dim 
+    # equals to query and key dim
+    acc = tl.zeros([chunk_size, HEAD_DIM], dtype=tl.float32)
 
     # we allow row chunk size to differ from column chunk,
     # so we 
@@ -370,10 +366,12 @@ def _softmax_with_decay_fwd(
     nD = tl.cdiv(HEAD_DIM, BLOCK_D)
 
     # load scales
-    qk_scale = 1.44269504  # 1/log(2)
+    # qk_scale = 1.44269504  # 1/log(2)
     offs_i = tl.arange(0, chunk_size)
     offs_j = tl.arange(0, BLOCK_C) # columns
     offs_d = tl.arange(0, BLOCK_D)
+    offs_d = tl.arange(0, BLOCK_D)
+    offs_v = tl.arange(0, HEAD_DIM)
     limit_r = seqlen - pid_r * chunk_size # row limit
     limit_c = seqlen # col_limit
 
@@ -389,12 +387,15 @@ def _softmax_with_decay_fwd(
     for c in range(0, nC):
 
         affinity = tl.zeros((chunk_size, BLOCK_C), dtype=tl.float32)
-        logits = tl.zeros((chunk_size, BLOCK_C), dtype=tl.float32)
+        score = tl.zeros((chunk_size, BLOCK_C), dtype=tl.float32)
 
         # compute the keys (tiled on dimension)
         limit_d = HEAD_DIM # dims
         k_mat_ptr = keys_r
+        q_mat_ptr = queries_r
         kt_mat_ptr = keys
+        v_mat_ptr = values
+
         for _ in range(0, nD):
 
             # TODO: for the last block need to do the triangular masking
@@ -402,24 +403,36 @@ def _softmax_with_decay_fwd(
             # - since its repetitive, especially in the case nD == 1
             k_mat = tl.load(
                 (
-                    k_mat_ptr + offs_i[:, None] * k_stride_seq
+                    k_mat_ptr 
+                    + offs_i[:, None] * k_stride_seq
                     + offs_d[None, :] * k_stride_dim
                 ),
                 mask=(offs_i[:, None] < limit_r) & (offs_d[None, :] < limit_d), 
                 other=0.0
             )
+            q_mat = tl.load(
+                (
+                    q_mat_ptr 
+                    + offs_i[:, None] * q_stride_seq
+                    + offs_d[None, :] * q_stride_dim
+                ),
+                mask=(offs_i[:, None] < limit_r) & (offs_d[None, :] < limit_d), 
+                other=0.0
+            )
+
             kt_mat = tl.load(
                 (
                     kt_mat_ptr 
                     + offs_d[:, None] * k_stride_dim
                     + offs_j[None, :] * k_stride_seq
                 ),
-                mask=(offs_i[:, None] < limit_c) & (offs_d[None, :] < limit_d), 
+                mask=(offs_j[:, None] < limit_c) & (offs_d[None, :] < limit_d), 
                 other=0.0
             )
 
             # TODO: handle precision
             affinity += tl.dot(k_mat, kt_mat, input_precision="ieee")
+            score += tl.dot(q_mat, kt_mat, input_precision="ieee")
 
             # handle the limit
             limit_d -= BLOCK_D
@@ -427,6 +440,7 @@ def _softmax_with_decay_fwd(
             # handle the pointers
             k_mat_ptr += BLOCK_D * k_stride_dim
             kt_mat_ptr += BLOCK_D * k_stride_dim
+            q_mat_ptr += BLOCK_D * k_stride_dim
 
         # .relu().pow(2/3)
         affinity = tl.exp2(tl.log2(tl.maximum(affinity, 0.0)) * 2.0 / 3.0)
@@ -451,7 +465,8 @@ def _softmax_with_decay_fwd(
         if offset >= 0 and chunk_size >= offset:
             decay = tl.where(
                 (offs_i[:, None] > (offs_j[None, :] + offset)), 
-                decay, 0.0
+                decay, 
+                0.0 # dont set this to -inf yet because we need to cumsum
             )
 
         # cumsum over the chunk rows
@@ -486,8 +501,16 @@ def _softmax_with_decay_fwd(
             # increment pointer
             decay_prev_chunk += BLOCK_C * d_stride_kseq
 
+        # NOTE: see above notes
+        offset = c * BLOCK_C - pid_r * chunk_size
+        if offset >= 0 and chunk_size >= offset:
+            decay = tl.where(
+                (offs_i[:, None] >= (offs_j[None, :] + offset)), 
+                decay, 
+                - float("inf"), # not set it to inf
+            )
+
         if res_decay:
-            # returns the decay before the cumsum
             tl.store(
                 (
                     res_decay 
@@ -496,18 +519,72 @@ def _softmax_with_decay_fwd(
                 ),
                 decay,
                 mask=(
-                    (offs_i[:,None] < limit_r)
+                    (offs_i[:, None] < limit_r)
                     & (offs_j[None, :] < limit_c)
                 )
             )
             res_decay += BLOCK_C * res_decay_stride_kseq
 
+        # ---------- ONLINE SOFTMAX (FLASH ATTENTION) -------------
+        score += decay
+
+        # Stabilize logsumexp using the subtract max trick
+        score_max_prev = score_max # m_{i-1}
+        score_denom_prev = score_denom # d_{i-1}
+        score_max = tl.maximum(
+            score_max, 
+            tl.max(score, axis=1) , 
+        ) # m_i
+        alpha = (
+            score_denom_prev * 
+            tl.math.exp(
+                score_max_prev - score_max
+            ) 
+        ) # d_{i-1} * exp(m_{i-1} - m_i)
+        weights = tl.math.exp(
+            score - score_max[:, None]
+        ) # exp(q^T k - m_i)
+
+        # d_i = d_{i-1} * exp(m_{i-1} - m_i) + \sum_{j} exp(q^T k - m_i)
+        score_denom *= alpha
+        score_denom += tl.sum(weights, axis=1)
+
+        v_mat = tl.load(
+            (
+                v_mat_ptr 
+                + offs_j[:, None] * v_stride_seq
+                + offs_v[None, :] * v_stride_dim
+            ),
+            mask=(offs_j[:, None] < limit_c),
+            other=0.0
+        )
+
+        # o_{i-1} * d_i * exp(m_{i-1} - m_i) / d_{i-1}
+        # +  \sum_{j} exp(q^T k - m_i) / d_i *  V[j]
+        acc *= (alpha / score_denom)[:, None]
+        acc += tl.dot(
+            weights / score_denom[:, None],
+            v_mat
+        )
+
         # move pointer with column chunk
         keys += BLOCK_C * k_stride_seq
-        res += BLOCK_C * res_stride_seq
+        values += BLOCK_C * v_stride_seq
         src += BLOCK_C * src_stride_seq
 
         # handle the limit
         limit_c -= BLOCK_C
 
     # - 
+
+    tl.store(
+        (
+            res_r 
+            + offs_i[:, None] * res_stride_seq
+            + offs_v[None, :] * res_stride_dim
+        ),
+        acc, 
+        mask=(
+            (offs_i[:, None] < limit_r)
+        )
+    )

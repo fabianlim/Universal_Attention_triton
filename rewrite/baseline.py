@@ -82,7 +82,8 @@ def parallelizeable_implementation(
     # can be computed in parallel using
     # l / chunks_size instances
 
-    targ = torch.empty(b,h,l,d)
+    # targ = torch.empty(b,h,l,d)
+    outputs = []
     for i in range(0, l // chunk_size):  
 
         # - compute the delay across the chunked rows
@@ -119,7 +120,7 @@ def parallelizeable_implementation(
         # take into account the chunked boundary
         # conditions
         if i > 0:
-            decay *= chunked_decay[...,i-1:i,:]
+            decay = decay * chunked_decay[...,i-1:i,:]
 
         # - the the causal delay values
         # with strict < to the the upper triangular
@@ -142,10 +143,8 @@ def parallelizeable_implementation(
         ).add(decay.log())
         denom = logits.logsumexp(dim=-1)
         score = logits.sub(denom.unsqueeze(-1))
-        targ[
-            ..., 
-            i*chunk_size:(i+1)*chunk_size,
-            :
-        ] = score.exp().matmul(v)
 
-    return targ
+        # collect the outputs
+        outputs.append(score.exp().matmul(v))
+
+    return torch.concat(outputs, dim=-2)

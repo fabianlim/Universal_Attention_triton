@@ -225,7 +225,8 @@ def softmax_with_decay_fwd(
     dest: torch.Tensor,
     chunked_decay: torch.Tensor,
     chunk_size: int = 16,
-    return_decay: bool = False
+    return_decay: bool = False,
+    skip_preprocessing: bool = False,
 ):
     # TODO: check sizes
     b, nheads, qlen, qdim = q.shape
@@ -237,16 +238,17 @@ def softmax_with_decay_fwd(
 
     grid = (b, nheads, triton.cdiv(qlen, chunk_size))
 
-    # NOTE: move this somewhere?
-    # L2-normalize K
-    k = k / k.pow(2).sum(-1,True).sqrt().add(1e-6)
+    if not skip_preprocessing:
+        # NOTE: move this somewhere?
+        # L2-normalize K
+        k = k / k.pow(2).sum(-1,True).sqrt().add(1e-6)
 
-    # sigmoid
-    src = src.sigmoid()
-    dest = dest.sigmoid()
+        # sigmoid
+        src = src.sigmoid()
+        dest = dest.sigmoid()
 
-    # NOTE: 
-    # - static_src and static_dest assumed to be sigmoided
+        # NOTE: 
+        # - static_src and static_dest assumed to be sigmoided
 
     res = torch.zeros(
         (b, nheads, qlen, vdim), 

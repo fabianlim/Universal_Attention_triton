@@ -30,7 +30,7 @@ def chunked_decay(
     res = torch.zeros(
         (b, kvheads, num_chunks, klen), 
         device=keys.device, 
-        #dtype=torch.float32
+        dtype=torch.float32
     )
 
     grid = (b, kvheads, num_chunks)
@@ -117,7 +117,7 @@ def _chunked_decay(
         dest + offs_i * dest_stride_seq,
         mask=offs_i < limit_r,
         other=0.0,
-    )
+    ).to(tl.float32)
     dest_vec = tl.exp2(tl.log2(dest_vec) / 3.0) # pow (1/3)
 
     # process the columns
@@ -143,7 +143,7 @@ def _chunked_decay(
                 ),
                 mask=(offs_i[:, None] < limit_r) & (offs_d[None, :] < limit_d), 
                 other=0.0
-            )
+            ).to(tl.float32)
             kt_mat = tl.load(
                 (
                     kt_mat_ptr 
@@ -152,10 +152,10 @@ def _chunked_decay(
                 ),
                 mask=(offs_i[:, None] < limit_c) & (offs_d[None, :] < limit_d), 
                 other=0.0
-            )
+            ).to(tl.float32)
 
             # TODO: handle precision
-            affinity += tl.dot(k_mat, kt_mat, input_precision="ieee")
+            affinity += tl.dot(k_mat, kt_mat)
 
             # handle the limit
             limit_d -= BLOCK_D
@@ -172,7 +172,7 @@ def _chunked_decay(
             src + offs_j * src_stride_seq,
             mask=offs_j < limit_c,
             other=0.0,
-        )
+        ).to(tl.float32)
         src_vec = tl.exp2(tl.log2(src_vec) / 3.0) # pow (1/3)
         affinity = affinity * dest_vec[:, None] * src_vec[None, :]
 
@@ -253,7 +253,7 @@ def softmax_with_decay_fwd(
     res = torch.zeros(
         (b, nheads, qlen, vdim), 
         device=q.device, 
-        #dtype=torch.float32
+        dtype=torch.float32
     ) 
 
     res_decay = None
@@ -262,6 +262,7 @@ def softmax_with_decay_fwd(
         res_decay = torch.zeros(
             (b, nheads, qlen, klen), 
             device=q.device, 
+            dtype=torch.float32
         ) 
 
     _softmax_with_decay_fwd[grid](
@@ -286,6 +287,8 @@ def softmax_with_decay_fwd(
     )
 
     if return_decay:
+        # NOTE: the upper tril entries not garanteed to be
+        # correct due to causal nature of kernel
         return res, res_decay
     return res
 
@@ -317,8 +320,7 @@ def _softmax_with_decay_fwd(
     HEAD_DIM: tl.constexpr,
 ):
     # dtype = desc_q.dtype.element_ty
-
-    # TODO: need to somehow assert that BLOCK_M divides chunk_size
+    # assert BLOCK_C % chunk_size == 0
 
     pid_b = tl.program_id(0) # batch
     pid_h = tl.program_id(1) # query head
@@ -382,7 +384,7 @@ def _softmax_with_decay_fwd(
         dest + offs_i * dest_stride_seq,
         mask=offs_i < limit_r,
         other=0.0,
-    )
+    ).to(tl.float32)
     dest_vec = tl.exp2(tl.log2(dest_vec) / 3.0) # pow (1/3)
 
     # process the columns
@@ -411,7 +413,7 @@ def _softmax_with_decay_fwd(
                 ),
                 mask=(offs_i[:, None] < limit_r) & (offs_d[None, :] < limit_d), 
                 other=0.0
-            )
+            ).to(tl.float32)
             q_mat = tl.load(
                 (
                     q_mat_ptr 
@@ -420,7 +422,7 @@ def _softmax_with_decay_fwd(
                 ),
                 mask=(offs_i[:, None] < limit_r) & (offs_d[None, :] < limit_d), 
                 other=0.0
-            )
+            ).to(tl.float32)
 
             kt_mat = tl.load(
                 (
@@ -430,11 +432,11 @@ def _softmax_with_decay_fwd(
                 ),
                 mask=(offs_j[:, None] < limit_c) & (offs_d[None, :] < limit_d), 
                 other=0.0
-            )
+            ).to(tl.float32)
 
             # TODO: handle precision
-            affinity += tl.dot(k_mat, kt_mat, input_precision="ieee")
-            score += tl.dot(q_mat, kt_mat, input_precision="ieee")
+            affinity += tl.dot(k_mat, kt_mat)
+            score += tl.dot(q_mat, kt_mat)
 
             # handle the limit
             limit_d -= BLOCK_D
@@ -452,7 +454,7 @@ def _softmax_with_decay_fwd(
             src + offs_j * src_stride_seq,
             mask=offs_j < limit_c,
             other=0.0,
-        )
+        ).to(tl.float32)
         src_vec = tl.exp2(tl.log2(src_vec) / 3.0) # pow (1/3)
         affinity = affinity * dest_vec[:, None] * src_vec[None, :]
 
@@ -494,7 +496,7 @@ def _softmax_with_decay_fwd(
                     offs_j[None, :] < offset
                 ),
                 other=0.0,
-            )
+            ).to(tl.float32)
 
             # hopefully this can distribute across
             # rows
@@ -563,7 +565,7 @@ def _softmax_with_decay_fwd(
             ),
             mask=(offs_j[:, None] < limit_c),
             other=0.0
-        )
+        ).to(tl.float32)
 
         # o_{i-1} * d_{i-1} * exp(m_{i-1} - m_i) / d_i
         # +  \sum_{j} exp(q^T k - m_i) / d_i *  V[j]

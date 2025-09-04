@@ -150,7 +150,7 @@ def _chunked_decay(
                     + offs_d[:, None] * k_stride_dim
                     + offs_j[None, :] * k_stride_seq
                 ),
-                mask=(offs_i[:, None] < limit_c) & (offs_d[None, :] < limit_d), 
+                mask=(offs_j[:, None] < limit_c) & (offs_d[None, :] < limit_d), 
                 other=0.0
             ).to(tl.float32)
 

@@ -10,9 +10,10 @@ def simplest_implementation(
     v: torch.Tensor, # b,h,l,d
     static_src: torch.Tensor,
     static_dest: torch.Tensor,
+    return_decay: bool = False,
 ):
 
-    #
+    # b, h, l, d
     _, _, l, _ = q.shape
     
     # L2-normalize K
@@ -42,7 +43,9 @@ def simplest_implementation(
     denom = logits.logsumexp(dim=-2)
     score = logits.sub(denom.unsqueeze(-2))
     targ = score.exp().transpose(-1,-2).matmul(v)
-    # return decay
+
+    if return_decay:
+        return targ, denom, decay
     return targ, denom
 
 # The pytorch autograd version is borrowed from here: 

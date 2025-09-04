@@ -7,6 +7,7 @@ from utils_methods import (
 
 from methods_test import blockwise_ua_test_harness
 from Universal_Attention.triton.universal_attention_kernel import _universal_attention_fwd, _universal_attention_bwd
+from Universal_Attention.triton.universal_attention_kernel_opt import _attention
 from kernels import (
     chunked_decay,
     softmax_with_decay_fwd
@@ -99,6 +100,22 @@ def run_legacy_impl_one(
     out, denom = _universal_attention_fwd(kc, vc, queries, static_src, static_dest)
     return out
 
+def run_legacy_impl_two(
+    queries, 
+    keys, 
+    values, 
+    static_src, static_dest,
+):
+    output = _attention.apply(
+        queries,
+        keys,
+        values,
+        True, 1.0, 
+        static_src,
+        static_dest,
+    )
+    return output
+
 def run_two_pass(
     queries, 
     keys, 
@@ -151,16 +168,22 @@ if __name__ == '__main__':
             res, _ = benchmark(lambda: run_legacy_impl_one(q, k, v, static_src, static_dest, 32))
             res_l1 = {
                 'b': b, 'l': l, 'h': h, 'd': d, 'chunk_size': chunk_size, 
-                # 'time': t,
                 **res,
                 'method': 'legacy_impl_one',
             }
             print (json.dumps(res_l1), flush=True)
 
+            res, _ = benchmark(lambda: run_legacy_impl_two(q, k, v, static_src, static_dest))
+            res_l2 = {
+                'b': b, 'l': l, 'h': h, 'd': d, 'chunk_size': chunk_size, 
+                **res,
+                'method': 'legacy_impl_two',
+            }
+            print (json.dumps(res_l2), flush=True)
+
             res, _ = benchmark(lambda: run_two_pass(q, k, v, static_src, static_dest, chunk_size))
             res_tp = {
                 'b': b, 'l': l, 'h': h, 'd': d, 'chunk_size': chunk_size, 
-                # 'time': t,
                 **res,
                 'method': 'two_pass',
             }

@@ -17,6 +17,12 @@ import time
 
 # inspired by https://github.com/IST-DASLab/marlin/blob/master/bench.py
 def benchmark(f, warmup=1, iter=10):
+
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    mem_reserved = torch.cuda.memory_reserved()
+    mem_allocated = torch.cuda.memory_allocated()
+
     for i in range(warmup + iter):
         outputs = f()
         # We do not synchronize here in order to hide the kernel launch overhead during benchmarkining as this will also
@@ -26,10 +32,16 @@ def benchmark(f, warmup=1, iter=10):
             tick = time.time()
     torch.cuda.synchronize()
     res = (time.time() - tick) / iter
+    mem_reserved = torch.cuda.max_memory_reserved() - mem_reserved 
+    mem_allocated = torch.cuda.max_memory_allocated() - mem_allocated
     # Make sure there is enough to "cool down" the GPU in between benchmarks to avoid throttling for later runs when
     # we execute many benchmarks consecutively
     time.sleep(1.)
-    return res, outputs
+    return {
+        'time': res,
+        'mem_reserved': mem_reserved,
+        'mem_allocated': mem_allocated,
+    }, outputs
 
 def prepare_problem(
     b: int, l: int, h: int, d: int,
@@ -113,11 +125,15 @@ def run_two_pass(
 
 if __name__ == '__main__':
 
-    BATCHES = [1, 2]
-    SEQUENCE_LENS = [32, 64]
-    HEADS = [1, 2]
-    HEAD_DIM = [16, 32]
-    CHUNK_SIZE = [32]
+    BATCHES = [
+        8, 16,
+    ]
+    SEQUENCE_LENS = [
+        32, 1024
+    ]
+    HEADS = [4, 16, 32]
+    HEAD_DIM = [16, 32, 128]
+    CHUNK_SIZE = [16]
 
     for b, l, h, d, chunk_size in product(
         BATCHES, SEQUENCE_LENS, 
@@ -131,19 +147,24 @@ if __name__ == '__main__':
         )
 
         with torch.no_grad():
-            t, _ = benchmark(lambda: run_legacy_impl_one(q, k, v, static_src, static_dest, chunk_size))
+            # NOTE: for legacy we just use a fixed chunk_size
+            res, _ = benchmark(lambda: run_legacy_impl_one(q, k, v, static_src, static_dest, 32))
             res_l1 = {
-                'b': b, 'l': l, 'h': h, 'd': d, 'chunk_size': chunk_size, 'time': t,
+                'b': b, 'l': l, 'h': h, 'd': d, 'chunk_size': chunk_size, 
+                # 'time': t,
+                **res,
                 'method': 'legacy_impl_one',
             }
-            print (json.dumps(res_l1))
+            print (json.dumps(res_l1), flush=True)
 
-            t, _ = benchmark(lambda: run_two_pass(q, k, v, static_src, static_dest, chunk_size))
+            res, _ = benchmark(lambda: run_two_pass(q, k, v, static_src, static_dest, chunk_size))
             res_tp = {
-                'b': b, 'l': l, 'h': h, 'd': d, 'chunk_size': chunk_size, 'time': t,
+                'b': b, 'l': l, 'h': h, 'd': d, 'chunk_size': chunk_size, 
+                # 'time': t,
+                **res,
                 'method': 'two_pass',
             }
-            print (json.dumps(res_tp))
+            print (json.dumps(res_tp), flush=True)
 
 
 

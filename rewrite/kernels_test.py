@@ -67,7 +67,7 @@ def test_two_pass_implementation(
         [1, 4, 8, 16, 32],
         [16, 32, 64, 128],
         [
-            16, # 32, 64, 128
+            32, 64, 128
         ]
     )
 )
@@ -77,7 +77,7 @@ def test_two_pass_kernel_fwd(
     h: int, # heads
     d: int, # dim
     chunk_size: int,
-    atol: float = 1e-2,
+    atol: float = 5e-3,
     rtol: float = 1e-3,
 ):
 
@@ -110,7 +110,10 @@ def test_two_pass_kernel_fwd(
     decay_ref = torch.tril(decay_ref.transpose(-2,-1))
 
     # Pass1: get the chunked kernel
-    decay_chunks = chunked_decay(k, static_src, static_dest)
+    decay_chunks = chunked_decay(
+        k, static_src, static_dest, 
+        chunk_size=chunk_size
+    )
 
     # - we then need to pass the chunks forward
     # NOTE: maybe write a kernel

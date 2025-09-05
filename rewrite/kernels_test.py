@@ -12,7 +12,7 @@ from utils_methods import (
 
 import pytest
 
-def test_two_pass_implementation(
+def test_two_pass_concept(
     b: int = 1, # batch
     l: int = 32, # sequence
     h: int = 2, # heads
@@ -59,11 +59,38 @@ def test_two_pass_implementation(
             a.grad, b.grad, atol=atol, rtol=rtol
         )
 
+def _two_pass_routine(
+    q: torch.tensor,
+    k: torch.tensor,
+    v: torch.tensor,
+    src: torch.tensor,
+    dest: torch.tensor,
+    chunk_size: int,
+    return_decay: bool,
+):
+    # Pass1: get the chunked kernel
+    decay_chunks = chunked_decay(
+        k, src, dest, 
+        chunk_size=chunk_size
+    )
+
+    # - we then need to pass the chunks forward
+    # NOTE: maybe write a kernel
+    decay_chunks = decay_chunks.cumsum(-2)
+
+    # Pass2: run the softmax
+    return softmax_with_decay_fwd(
+        q, k, v, 
+        src, dest, 
+        decay_chunks,
+        return_decay=return_decay,
+        chunk_size=chunk_size
+    )
 
 @pytest.mark.parametrize(
     "b,l,h,d,chunk_size", product(
         [1, 2, 4, 8, 32],
-        [32, 64, 128, 256, 1024],
+        [32, 64, 100, 128, 256, 500, 1024],
         [1, 4, 8, 16, 32],
         [16, 32, 64, 128],
         [
@@ -81,15 +108,11 @@ def test_two_pass_kernel_fwd(
     rtol: float = 1e-3,
 ):
 
-    if l % chunk_size != 0:
-        pytest.skip(
-            f"sequence length {l} is not divisible by {chunk_size}"
-        )
-
     set_seed()
     q, k, v, static_src, static_dest = random_instance(
-        b, l, h, d, device='cuda', requires_grad=True
+        b, l, h, d, device='cuda', requires_grad=False
     )
+
     q2, k2, v2 = (
         deepcopy(q),
         deepcopy(k),
@@ -102,31 +125,20 @@ def test_two_pass_kernel_fwd(
     )
 
     # run reference
-    out_ref, _, decay_ref = simplest_implementation(
+    out_ref, _, decay_ref, score = simplest_implementation(
         q, k, v, static_src, static_dest,
         return_decay=True,
     )
     # - because this flips rows,cols
     decay_ref = torch.tril(decay_ref.transpose(-2,-1))
 
-    # Pass1: get the chunked kernel
-    decay_chunks = chunked_decay(
-        k, static_src, static_dest, 
-        chunk_size=chunk_size
-    )
-
-    # - we then need to pass the chunks forward
-    # NOTE: maybe write a kernel
-    decay_chunks = decay_chunks.cumsum(-2)
-
-    # Pass2: run the softmax
-    out, decay = softmax_with_decay_fwd(
+    out, decay = _two_pass_routine(
         q2, k2, v2, 
         static_src2, static_dest2, 
-        decay_chunks,
         return_decay=True,
         chunk_size=chunk_size
     )
+
     # - the upper triangular entries are not 
     # - gauranteed to be pop correctly
     decay = torch.tril(torch.exp(decay))

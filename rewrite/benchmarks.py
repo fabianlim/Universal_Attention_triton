@@ -146,7 +146,7 @@ if __name__ == '__main__':
         8, 16,
     ]
     SEQUENCE_LENS = [
-        32, 1024
+        32, 500, 1024
     ]
     HEADS = [4, 16, 32]
     HEAD_DIM = [16, 32, 128]
@@ -165,13 +165,14 @@ if __name__ == '__main__':
 
         with torch.no_grad():
             # NOTE: for legacy we just use a fixed chunk_size
-            res, _ = benchmark(lambda: run_legacy_impl_one(q, k, v, static_src, static_dest, 32))
-            res_l1 = {
-                'b': b, 'l': l, 'h': h, 'd': d, 'chunk_size': chunk_size, 
-                **res,
-                'method': 'legacy_impl_one',
-            }
-            print (json.dumps(res_l1), flush=True)
+            if l % chunk_size == 0:
+                res, _ = benchmark(lambda: run_legacy_impl_one(q, k, v, static_src, static_dest, 32))
+                res_l1 = {
+                    'b': b, 'l': l, 'h': h, 'd': d, 'chunk_size': chunk_size, 
+                    **res,
+                    'method': 'legacy_impl_one',
+                }
+                print (json.dumps(res_l1), flush=True)
 
             res, _ = benchmark(lambda: run_legacy_impl_two(q, k, v, static_src, static_dest))
             res_l2 = {
@@ -188,6 +189,8 @@ if __name__ == '__main__':
                 'method': 'two_pass',
             }
             print (json.dumps(res_tp), flush=True)
+
+    print ("Benchmark completed!")
 
 
 

@@ -22,6 +22,7 @@ def chunked_decay(
     keys: torch.Tensor, # b,h,l,d
     src: torch.Tensor,
     dest: torch.Tensor,
+    skip_preprocessing: bool = False,
     chunk_size: int = 16,
 ):
 
@@ -35,16 +36,18 @@ def chunked_decay(
 
     grid = (b, kvheads, num_chunks)
 
-    # NOTE: move this somewhere?
-    # L2-normalize K
-    keys = keys / keys.pow(2).sum(-1,True).sqrt().add(1e-6)
+    if not skip_preprocessing:
 
-    # sigmoid
-    src = src.sigmoid()
-    dest = dest.sigmoid()
+        # NOTE: move this somewhere?
+        # L2-normalize K
+        keys = keys / keys.pow(2).sum(-1,True).sqrt().add(1e-6)
 
-    # NOTE: 
-    # - static_src and static_dest assumed to be sigmoided
+        # sigmoid
+        src = src.sigmoid()
+        dest = dest.sigmoid()
+
+        # NOTE: 
+        # - static_src and static_dest assumed to be sigmoided
 
     _chunked_decay[grid](
         res, keys, src, dest,
@@ -353,13 +356,6 @@ def _softmax_with_decay_fwd(
         # decay_prev = decay + (pid_r-1) * d_stride_chunk
         decay_prev_chunk += (pid_r-1) * d_stride_chunk
 
-    # online-softmax accumulation elements
-    score_max = tl.zeros([chunk_size], dtype=tl.float32) - float("inf")
-    score_denom = tl.zeros([chunk_size], dtype=tl.float32) + 1.0
-    # TODO: its not gauranteed that value dim 
-    # equals to query and key dim
-    acc = tl.zeros([chunk_size, HEAD_DIM], dtype=tl.float32)
-
     # we allow row chunk size to differ from column chunk,
     # so we 
     # - a the pid_r-th row chunk will take up (pid_r * chunk_size) columns
@@ -378,6 +374,16 @@ def _softmax_with_decay_fwd(
     offs_v = tl.arange(0, HEAD_DIM)
     limit_r = seqlen - pid_r * chunk_size # row limit
     limit_c = seqlen # col_limit
+
+    # online-softmax accumulation elements
+    # - for those out of row chunk set it 0
+    score_max = tl.where( 
+        offs_i < limit_r, -float("inf"), 0.0
+    )
+    score_denom = tl.zeros([chunk_size], dtype=tl.float32) + 1.0
+    # TODO: its not gauranteed that value dim 
+    # equals to query and key dim
+    acc = tl.zeros([chunk_size, HEAD_DIM], dtype=tl.float32)
 
     # load the dest
     dest_vec = tl.load(
@@ -430,7 +436,7 @@ def _softmax_with_decay_fwd(
                     + offs_d[:, None] * k_stride_dim
                     + offs_j[None, :] * k_stride_seq
                 ),
-                mask=(offs_j[:, None] < limit_c) & (offs_d[None, :] < limit_d), 
+                mask= (offs_d[:, None] < limit_d) & (offs_j[None, :] < limit_c),
                 other=0.0
             ).to(tl.float32)
 
@@ -534,12 +540,34 @@ def _softmax_with_decay_fwd(
         # ---------- ONLINE SOFTMAX (FLASH ATTENTION) -------------
         score += decay
 
+        # - need to do this for the last chunk ends
+        # - so that the below tl.max(score) will not 
+        #   take those values into account
+        #  x x x | -inf -inf 
+        #  x x x | -inf -inf 
+        #  0 0 0 |  0    0 
+        if limit_c < BLOCK_C:
+            score = tl.where(
+                offs_j[None, :] < limit_c,
+                score,
+                - float("inf")
+            )
+
+        if limit_r < chunk_size:
+            score = tl.where(
+                offs_i[:, None] < limit_r,
+                score, 0.0
+            )
+
         # Stabilize logsumexp using the subtract max trick
+        # - recall above if for off_i >= limit_r we set
+        #   score_max - 0.
+        # - so score_max = max(score_max, tl.max(score))) = 0 for these rows
         score_max_prev = score_max # m_{i-1}
         score_denom_prev = score_denom # d_{i-1}
         score_max = tl.maximum(
             score_max, 
-            tl.max(score, axis=1) , 
+            tl.max(score, axis=1), 
         ) # m_i
         score_denom_corrected = (
             score_denom_prev * 
@@ -550,6 +578,14 @@ def _softmax_with_decay_fwd(
         weights = tl.exp(
             score - score_max[:, None]
         ) # exp(q^T k - m_i)
+
+        # - similarly, we handle this boundary 
+        #   so as to not participate in the tl.sum below
+        if limit_c < BLOCK_C:
+            weights = tl.where(
+                offs_j[None, :] < limit_c,
+                weights, 0.0
+            )
 
         # - update score denom
         # d_i = d_{i-1} * exp(m_{i-1} - m_i) + \sum_{j} exp(q^T k - m_i)

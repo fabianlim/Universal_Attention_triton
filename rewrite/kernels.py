@@ -263,7 +263,7 @@ def softmax_with_decay_fwd(
     if return_decay:
         # NOTE: this should only be used for debugging
         res_decay = torch.zeros(
-            (b, nheads, qlen, klen), 
+            (b, kvheads, qlen, klen), 
             device=q.device, 
             dtype=torch.float32
         ) 
@@ -286,6 +286,7 @@ def softmax_with_decay_fwd(
         ),
         seqlen=klen,
         HEAD_DIM=qdim,
+        group_size=nheads // kvheads,
         chunk_size=chunk_size,
     )
 
@@ -317,6 +318,7 @@ def _softmax_with_decay_fwd(
     res_decay_stride_b, res_decay_stride_h, res_decay_stride_qseq, 
     res_decay_stride_kseq,
     seqlen: int,
+    group_size: int,
     chunk_size: tl.constexpr,
     BLOCK_C: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -327,17 +329,18 @@ def _softmax_with_decay_fwd(
 
     pid_b = tl.program_id(0) # batch
     pid_h = tl.program_id(1) # query head
+    hkv = pid_h // group_size # key / value head
     pid_r = tl.program_id(2) # row chunk
 
     # offset by batch and head
     res += pid_b * res_stride_b + pid_h * res_stride_h
     queries += pid_b * q_stride_b + pid_h * q_stride_h
-    keys += pid_b * k_stride_b + pid_h * k_stride_h
-    values += pid_b * v_stride_b + pid_h * v_stride_h
-    chunked_decay += pid_b * d_stride_b + pid_h * d_stride_h
+    keys += pid_b * k_stride_b + hkv * k_stride_h
+    values += pid_b * v_stride_b + hkv * v_stride_h
+    chunked_decay += pid_b * d_stride_b + hkv * d_stride_h
 
-    src += pid_b * src_stride_b + pid_h * src_stride_h
-    dest += pid_b * dest_stride_b + pid_h * dest_stride_h
+    src += pid_b * src_stride_b + hkv * src_stride_h
+    dest += pid_b * dest_stride_b + hkv * dest_stride_h
 
     # keys (row) and dest will be offset by chunk
     keys_r = keys + pid_r * chunk_size * k_stride_seq
@@ -346,7 +349,7 @@ def _softmax_with_decay_fwd(
     dest += pid_r * chunk_size * dest_stride_seq
 
     if res_decay:
-        res_decay += pid_b * res_decay_stride_b + pid_h * res_decay_stride_h
+        res_decay += pid_b * res_decay_stride_b + hkv * res_decay_stride_h
         res_decay += pid_r * chunk_size * res_decay_stride_qseq
 
     # decay offset by chunk index

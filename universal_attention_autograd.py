@@ -14,7 +14,8 @@ def simplest_implementation(
 ):
 
     # b, h, l, d
-    _, _, l, _ = q.shape
+    _, h, l, _ = q.shape
+    _, hkv, _, _ = k.shape
     
     # L2-normalize K
     k = k/k.pow(2).sum(-1,True).sqrt().add(1e-6)
@@ -37,6 +38,12 @@ def simplest_implementation(
         torch.ones(l,l, device=k.device).tril(-1).bool(),
         0
     )
+
+    # expand heads
+    if hkv < h:
+        k = torch.repeat_interleave(k, h // hkv, dim=1)
+        v = torch.repeat_interleave(v, h // hkv, dim=1)
+        decay = torch.repeat_interleave(decay, h // hkv, dim=1)
     
     # Compute softmax attention
     logits = k.matmul(q.transpose(-1,-2)).add(decay.log())

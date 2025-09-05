@@ -14,6 +14,7 @@ def parallelizeable_implementation(
 
     # b, h, l, d
     b, h, l, d = q.shape
+    _, hkv, _, _ = k.shape
     assert l % chunk_size == 0, \
         f"this function works for queries in multiple of {chunk_size}"
 
@@ -39,7 +40,7 @@ def parallelizeable_implementation(
     # can be compute in parallel using
     # l / chunks_size instances
     chunked_decay = torch.empty(
-        b, h, l // chunk_size, l,
+        b, hkv, l // chunk_size, l,
         device=q.device
     )
     for i in range(0, l // chunk_size):  
@@ -79,10 +80,16 @@ def parallelizeable_implementation(
     # - similar to mamba state passing
     chunked_decay = chunked_decay.cumprod(-2)
 
+    # expand heads
+    if hkv < h:
+        k = torch.repeat_interleave(k, h // hkv, dim=1)
+        v = torch.repeat_interleave(v, h // hkv, dim=1)
+        chunked_decay = torch.repeat_interleave(chunked_decay, h // hkv, dim=1)
+        static_src = torch.repeat_interleave(static_src, h // hkv, dim=1)
+        static_dest = torch.repeat_interleave(static_dest, h // hkv, dim=1)
+
     # can be computed in parallel using
     # l / chunks_size instances
-
-    # targ = torch.empty(b,h,l,d)
     outputs = []
     for i in range(0, l // chunk_size):  
 

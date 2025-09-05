@@ -1,6 +1,7 @@
 import torch
 import math
 import random
+from typing import Union, Tuple
 
 from Universal_Attention.universal_attention import UniversalAttention
 from Universal_Attention.triton.universal_attention_kernel_opt import _attention
@@ -14,20 +15,26 @@ def set_seed(seed: int=42):
 
 # create random instance
 def random_instance(
-    b: int, l: int, h: int, d: int,
+    b: int, l: int, 
+    h: Union[int, Tuple[int,int]], 
+    d: int,
     max_ = math.log(.1),
     min_ = math.log(.001),
     device = torch.device('cuda'),
     requires_grad: bool = False,
 ):
-    q = torch.randn(b,h,l,d, device=device, requires_grad=requires_grad)
-    k = torch.randn(b,h,l,d, device=device, requires_grad=requires_grad)
-    v = torch.randn(b,h,l,d, device=device, requires_grad=requires_grad)
+    hkv = h
+    if isinstance(h, tuple):
+        h, hkv = h
 
-    b1 = torch.rand(h, device=device) * (max_-min_) + min_
-    b2 = torch.rand(h, device=device) * (max_-min_) + min_
-    static_src = torch.randn(b,h,l, device=device).add(b1.unsqueeze(-1))
-    static_dest = torch.randn(b,h,l, device=device).add(b2.unsqueeze(-1))
+    q = torch.randn(b,h,l,d, device=device, requires_grad=requires_grad)
+    k = torch.randn(b,hkv,l,d, device=device, requires_grad=requires_grad)
+    v = torch.randn(b,hkv,l,d, device=device, requires_grad=requires_grad)
+
+    b1 = torch.rand(hkv, device=device) * (max_-min_) + min_
+    b2 = torch.rand(hkv, device=device) * (max_-min_) + min_
+    static_src = torch.randn(b,hkv,l, device=device).add(b1.unsqueeze(-1))
+    static_dest = torch.randn(b,hkv,l, device=device).add(b2.unsqueeze(-1))
 
     return q, k, v, static_src, static_dest
 

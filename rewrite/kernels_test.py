@@ -5,6 +5,7 @@ from rewrite.kernels import chunked_decay, softmax_with_decay_fwd
 from copy import deepcopy
 import torch
 from itertools import product
+from typing import Union, Tuple
 
 from utils_methods import (
     set_seed, random_instance, 
@@ -15,7 +16,7 @@ import pytest
 def test_two_pass_concept(
     b: int = 1, # batch
     l: int = 32, # sequence
-    h: int = 2, # heads
+    h: Union[int, Tuple[int,int]] = 2, # heads
     d: int = 16, # dim
     chunk_size: int = 16,
     rtol: float = 1e-4,
@@ -89,12 +90,15 @@ def _two_pass_routine(
 
 @pytest.mark.parametrize(
     "b,l,h,d,chunk_size", product(
-        [1, 2, 4, 8, 32],
-        [32, 64, 100, 128, 256, 500, 1024],
-        [1, 4, 8, 16, 32],
-        [16, 32, 64, 128],
+        [1, 2, 4, 8, 32], # batch
+        [32, 64, 100, 128, 256, 500, 1024], # seqlen
         [
-            32, 64, 128
+            1, 4, 8, 16, 32, # mha
+            (32, 8), # gqa
+        ], 
+        [16, 32, 64, 128], # head_dim
+        [
+            32, 64, 128 # chunk_size
         ]
     )
 )
@@ -125,7 +129,7 @@ def test_two_pass_kernel_fwd(
     )
 
     # run reference
-    out_ref, _, decay_ref, score = simplest_implementation(
+    out_ref, _, decay_ref = simplest_implementation(
         q, k, v, static_src, static_dest,
         return_decay=True,
     )
@@ -142,6 +146,11 @@ def test_two_pass_kernel_fwd(
     # - the upper triangular entries are not 
     # - gauranteed to be pop correctly
     decay = torch.tril(torch.exp(decay))
+
+    g = decay_ref.shape[1] // decay.shape[1]
+    if g > 1:
+        # if there is gqa, the decay will be repeated
+        decay_ref = decay_ref[:,::g]
 
     torch.testing.assert_close(
         decay_ref, decay, atol=atol, rtol=rtol,

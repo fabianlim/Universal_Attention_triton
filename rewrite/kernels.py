@@ -2,28 +2,14 @@ import torch
 import triton
 import triton.language as tl
 
-def ua_forward(
-    q: torch.Tensor, # b,h,l,d
-    k: torch.Tensor, # b,h,l,d
-    v: torch.Tensor, # b,h,l,d
-    static_src: torch.Tensor,
-    static_dest: torch.Tensor,
-    chunk_size: int = 16,
-    return_decay: bool = False,
-):
-    # TODO: check sizes
-    b, nheads, qlen, qdim = q.shape
-    _, kvheads, klen, _ = k.shape
-    _, _, _, vdim = v.shape
-    assert qlen == klen
-    assert nheads % kvheads == 0
+CHUNK_SIZE = 16 # TODO: tune this
 
 def chunked_decay(
     keys: torch.Tensor, # b,h,l,d
     src: torch.Tensor,
     dest: torch.Tensor,
     skip_preprocessing: bool = False,
-    chunk_size: int = 16,
+    chunk_size: int = CHUNK_SIZE,
 ):
 
     b, kvheads, klen, kdim = keys.shape
@@ -227,7 +213,7 @@ def softmax_with_decay_fwd(
     src: torch.Tensor,
     dest: torch.Tensor,
     chunked_decay: torch.Tensor,
-    chunk_size: int = 16,
+    chunk_size: int = CHUNK_SIZE,
     return_decay: bool = False,
     skip_preprocessing: bool = False,
 ):

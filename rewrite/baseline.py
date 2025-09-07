@@ -155,3 +155,35 @@ def parallelizeable_implementation(
         outputs.append(score.exp().matmul(v))
 
     return torch.concat(outputs, dim=-2)
+
+def softmax(x):
+    denom = x.logsumexp(dim=-1)
+    score = x.sub(denom.unsqueeze(-1))
+    out = score.exp()
+    return out
+
+# just a softmax for testing
+class Softmax(Function):
+
+    @staticmethod
+    def forward(
+        ctx, x,
+    ):
+        out = softmax(x)
+        ctx.save_for_backward(out)
+        return out
+
+    @staticmethod
+    def backward(ctx, dout):
+        # Note: when using mixed precision, dout is downcast but ddenom is always fp32
+
+        S, = ctx.saved_tensors 
+        # D = - S.outer(S)
+        # D = torch.masked_fill(D, torch.eye(l, dtype=bool), 0)
+        # D += ( torch.diag(S) * (1-torch.diag(S)))
+        # out = dout.matmul(D)
+
+        # equiv to
+        out = (dout - (dout * S).sum()) * S
+        print (out)
+        return out

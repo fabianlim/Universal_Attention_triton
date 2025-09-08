@@ -178,6 +178,16 @@ class UniversalAttention(Function):
             dZ2 * src.unsqueeze(-2).sigmoid() * Z3.relu().pow(2)
         ).sum(-1)
 
+        # NOTE: since we accepted src and dest befor ethe sigmoid
+        # we need to accomodate for the transformation, since the above
+        # derivation assumed src and dest were sigmoided
+        dsrc *= (
+            src.sigmoid() * (1 - src.sigmoid())
+        )
+        ddest *= (
+            dest.sigmoid() * (1 - dest.sigmoid())
+        )
+
         return (
             dK, # k
             dV, 

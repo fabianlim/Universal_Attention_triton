@@ -180,14 +180,19 @@ def _backward_slow_parallelizable(
         kc, # k-col
         src, # source
         dest, # dest
+        return_deltanet = False,
     ):
         # Compute decay values
+        deltanet = kr.matmul(kc.transpose(-1,-2)) 
         decay = 1 - (
-            kr.matmul(kc.transpose(-1,-2)).relu().pow(2) # deltanet-style decay
+            deltanet.relu().pow(2) # deltanet-style decay
             * dest.unsqueeze(-1) * src.unsqueeze(-2)
         ).pow(
             1/3 # aggregate the 3 types of decays by geometric mean
         )
+
+        if return_deltanet:
+            return torch.log(decay), deltanet
         return torch.log(decay)
 
     # ROWWISE!
@@ -279,11 +284,13 @@ def _backward_slow_parallelizable(
     # - this one should already have from the forward
     denom_store = torch.concat(denom_store, dim=-2)
     outputs_dV = []
+    outputs_dK_1 = []
+    outputs_dK_2 = []
 
     # COLWISE!
     for j in range(0, l // chunk_size):  
         # - compute the delay for a chunked column
-        decay = _compute_decay(
+        decay, deltanet = _compute_decay(
             k,
             k[
                 ..., 
@@ -295,6 +302,7 @@ def _backward_slow_parallelizable(
                 j*chunk_size:(j+1)*chunk_size,
             ],
             dest,
+            return_deltanet=True
         )
 
         # - part of recomputation: chunk mask
@@ -338,7 +346,7 @@ def _backward_slow_parallelizable(
 
         # get the column chunk logits
         dZ = dout.matmul(
-            k[
+            v[
                 ..., 
                 j*chunk_size:(j+1)*chunk_size,
                 :
@@ -348,15 +356,49 @@ def _backward_slow_parallelizable(
         dY *= score
 
         # compute dZ1 which is row-sum of Y
-        # dZ1 = torch.where(
-        #     mask2 == False, # negate it
-        #     dY.cumsum(dim=-2).flipud(),
-        #     0.
-        # )
+        dZ1 = torch.where(
+            mask == False, # negate it so its i > j
+            dY.flip(-2).cumsum(dim=-2).flip(-2),
+            0.
+        )
 
+        term = (
+            src[
+                ..., 
+                j*chunk_size:(j+1)*chunk_size,
+            ].unsqueeze(-2)
+            * dest.unsqueeze(-1)
+        )
+
+        term = 1 / (term.pow(1/3) + 1e-6) * deltanet.relu().pow(4/3)
+        term -= deltanet.relu().pow(2)
+        dZ3 = torch.where(
+            deltanet >= 0,
+            (
+                - dZ1 * 2 / 3 * deltanet / 
+                (term + 1e-6)
+            ),
+            0.
+        ) # b,h,l,l
+
+        outputs_dK_1.append(
+            2 * dZ3.matmul(
+                k[
+                    ..., 
+                    j*chunk_size:(j+1)*chunk_size,
+                    :
+                ]
+            )
+        ) # col chunks
+        outputs_dK_2.append(
+            dY.transpose(-2, -1).matmul(q)
+        ) # row chunks
 
     return (
-        None, 
+        (
+            sum(outputs_dK_1)
+            + torch.cat(outputs_dK_2, dim=-2)
+        ),
         torch.cat(outputs_dV, dim=-2),
         torch.cat(outputs_dQ, dim=-2),
         None,
@@ -408,6 +450,7 @@ class UniversalAttention(Function):
             dout, 
             k, v, q, 
             src.sigmoid(), dest.sigmoid(),
+            decay_chunks,
         )
         
         # NOTE: since we accepted src and dest befor ethe sigmoid

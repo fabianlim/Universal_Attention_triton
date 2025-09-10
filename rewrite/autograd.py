@@ -1,10 +1,12 @@
 from torch.autograd import Function
-from .kernels import chunked_decay, softmax_with_decay_fwd
+from .kernels import (
+    chunked_decay, softmax_with_decay_fwd, CHUNK_SIZE
+)
 import torch
 
 def _backward_slow_draft(
-    dout, 
-    k, v, q, src, dest, 
+    dout, k, v, q, src, dest, 
+    decay_chunks, # unused
 ):
     # L2-normalize K
     k = k/k.pow(2).sum(-1,True).sqrt().add(1e-6)
@@ -133,7 +135,7 @@ def _backward_slow_draft(
     dK += dY.transpose(-2, -1).matmul(q)
 
     # DEBUG
-    # daff = -dZ1.transpose(-2, -1)
+    # daff = -dZ1.transpose(-2, -1) # line 150
     # aff2 = Z3.relu().pow(2/3)
     # # dstat = daff * aff2 
     # # dstat_src = (dstat * dest.unsqueeze(-2).pow(1/3)).sum(-1)
@@ -163,7 +165,206 @@ def _backward_slow_draft(
         ddest
     )
 
+def _backward_slow_parallelizable(
+    dout, k, v, q, src, dest, chunked_decay,
+    chunk_size=CHUNK_SIZE,
+):
+    # L2-normalize K
+    k = k/k.pow(2).sum(-1,True).sqrt().add(1e-6)
+
+    b, h, l, d = q.shape
+    _, hkv, _, _ = k.shape
+    
+    def _compute_decay(
+        kr, # k-row
+        kc, # k-col
+        src, # source
+        dest, # dest
+    ):
+        # Compute decay values
+        decay = 1 - (
+            kr.matmul(kc.transpose(-1,-2)).relu().pow(2) # deltanet-style decay
+            * dest.unsqueeze(-1) * src.unsqueeze(-2)
+        ).pow(
+            1/3 # aggregate the 3 types of decays by geometric mean
+        )
+        return torch.log(decay)
+
+    # ROWWISE!
+    # can be computed in parallel using
+    # l / chunks_size instances
+    dZscore_store = []
+    denom_store = []
+    outputs_dQ = []
+    for i in range(0, l // chunk_size):  
+        # - compute the delay across the chunked rows
+        # - this can be fused as we recompute the delay
+        decay = _compute_decay(
+            k[
+                ..., 
+                i*chunk_size:(i+1)*chunk_size,
+                :
+            ],
+            k,
+            src,
+            dest[
+                ...,
+                i*chunk_size:(i+1)*chunk_size,
+            ],
+        )
+
+        # - part of recomputation: chunk mask
+        mask = (
+            torch.arange(
+                i*chunk_size,(i+1)*chunk_size,
+            ).unsqueeze(-1) <= 
+            torch.arange(l).unsqueeze(-2) 
+        ).to(q.device)
+
+        # recomputation: cumsum
+        decay = decay.masked_fill(
+            mask, 0.
+        ).cumsum(-2)
+
+        # take into account the chunked boundary
+        # conditions
+        if i > 0:
+            decay = decay + chunked_decay[...,i-1:i,:]
+
+        # - the the causal delay values
+        # with strict < to the the upper triangular
+        mask2 = (
+            torch.arange(
+                i*chunk_size,(i+1)*chunk_size,
+            ).unsqueeze(-1) <
+            torch.arange(l).unsqueeze(-2) 
+        ).to(q.device)
+        decay = decay.masked_fill(mask2, - torch.inf)
+
+        # get the row-chunked logits
+        # - can be computed by online softmax
+        logits = q[
+            ..., 
+            i*chunk_size:(i+1)*chunk_size,
+            :
+        ].matmul(
+            k.transpose(-1,-2)
+        ).add(decay)
+        denom = logits.logsumexp(dim=-1)
+        score = logits.sub(denom.unsqueeze(-1))
+        score = score.exp()
+
+        denom_store.append(denom.unsqueeze(-1)) # store for later
+
+        # dZ
+        dZ = dout[
+            ..., 
+            i*chunk_size:(i+1)*chunk_size,
+            :
+        ].matmul(
+            v.transpose(-1,-2)
+        )
+        _dzScore = (dZ * score).sum(-1, keepdim=True) # see notes above
+        dY = dZ - _dzScore
+        dY *= score
+
+        dZscore_store.append(_dzScore) # store it for later
+
+        # - backprop to Q values
+        outputs_dQ.append(dY.matmul(k))
+
+
+    # from the column summaries
+    dZscore_store = torch.concat(dZscore_store, dim=-2)
+    # - this one should already have from the forward
+    denom_store = torch.concat(denom_store, dim=-2)
+    outputs_dV = []
+
+    # COLWISE!
+    for j in range(0, l // chunk_size):  
+        # - compute the delay for a chunked column
+        decay = _compute_decay(
+            k,
+            k[
+                ..., 
+                j*chunk_size:(j+1)*chunk_size,
+                :
+            ],
+            src[
+                ...,
+                j*chunk_size:(j+1)*chunk_size,
+            ],
+            dest,
+        )
+
+        # - part of recomputation: chunk mask
+        mask = (
+            torch.arange(l).unsqueeze(-1) <=
+            torch.arange(
+                j*chunk_size,(j+1)*chunk_size,
+            ).unsqueeze(-2) 
+        ).to(q.device)
+
+        # recomputation: cumsum
+        decay = decay.masked_fill(
+            mask, 0.
+        ).cumsum(-2)
+
+        mask2 = (
+            torch.arange(l).unsqueeze(-1) <
+            torch.arange(
+                j*chunk_size,(j+1)*chunk_size,
+            ).unsqueeze(-2) 
+        ).to(q.device)
+        decay = decay.masked_fill(mask2, - torch.inf)
+
+        # get the column chunk logits
+        logits = q.matmul(
+            k[
+                ..., 
+                j*chunk_size:(j+1)*chunk_size,
+                :
+            ].transpose(-1,-2)
+        ).add(decay)
+
+        # take the denom from store
+        score = logits.sub(denom_store)
+        score = score.exp()
+        
+        # - dV
+        outputs_dV.append(
+            score.transpose(-1, -2).matmul(dout)
+        )
+
+        # get the column chunk logits
+        dZ = dout.matmul(
+            k[
+                ..., 
+                j*chunk_size:(j+1)*chunk_size,
+                :
+            ].transpose(-1,-2)
+        )
+        dY = dZ - dZscore_store # take from store
+        dY *= score
+
+        # compute dZ1 which is row-sum of Y
+        # dZ1 = torch.where(
+        #     mask2 == False, # negate it
+        #     dY.cumsum(dim=-2).flipud(),
+        #     0.
+        # )
+
+
+    return (
+        None, 
+        torch.cat(outputs_dV, dim=-2),
+        torch.cat(outputs_dQ, dim=-2),
+        None,
+        None,
+    )
+
 # this is a a draft of the 
+
 class UniversalAttention(Function):
 
     @staticmethod

@@ -286,6 +286,8 @@ def _backward_slow_parallelizable(
     outputs_dV = []
     outputs_dK_1 = []
     outputs_dK_2 = []
+    outputs_dsrc = []
+    outputs_ddest = []
 
     # COLWISE!
     for j in range(0, l // chunk_size):  
@@ -304,6 +306,7 @@ def _backward_slow_parallelizable(
             dest,
             return_deltanet=True
         )
+        deltanet_relu2 = deltanet.relu().pow(2)
 
         # - part of recomputation: chunk mask
         mask = (
@@ -362,22 +365,21 @@ def _backward_slow_parallelizable(
             0.
         )
 
-        term = (
+        # Z2 = Z3.relu().pow(2) * ds
+        ds = (
             src[
                 ..., 
                 j*chunk_size:(j+1)*chunk_size,
             ].unsqueeze(-2)
             * dest.unsqueeze(-1)
         )
+        term = deltanet_relu2 * ds # Z2
+        term = term.pow(2/3) - term
+        dZ2 = - dZ1 / (3 * term + 1e-6)
 
-        term = 1 / (term.pow(1/3) + 1e-6) * deltanet.relu().pow(4/3)
-        term -= deltanet.relu().pow(2)
         dZ3 = torch.where(
             deltanet >= 0,
-            (
-                - dZ1 * 2 / 3 * deltanet / 
-                (term + 1e-6)
-            ),
+            2 * dZ2 * ds * deltanet,
             0.
         ) # b,h,l,l
 
@@ -394,6 +396,22 @@ def _backward_slow_parallelizable(
             dY.transpose(-2, -1).matmul(q)
         ) # row chunks
 
+        # dest and src
+        outputs_dsrc.append(
+            (dZ2 * dest.unsqueeze(-1) * deltanet_relu2).sum(-2)
+        ) # b,h,c
+
+        outputs_ddest.append(
+            (
+                dZ2 * 
+                src[
+                    ..., 
+                    j*chunk_size:(j+1)*chunk_size,
+                ].unsqueeze(-2) * 
+                deltanet_relu2
+            ).sum(-1) # b,h,l
+        )
+
     return (
         (
             sum(outputs_dK_1)
@@ -401,8 +419,8 @@ def _backward_slow_parallelizable(
         ),
         torch.cat(outputs_dV, dim=-2),
         torch.cat(outputs_dQ, dim=-2),
-        None,
-        None,
+        torch.cat(outputs_dsrc, dim=-1),
+        sum(outputs_ddest),
     )
 
 # this is a a draft of the 

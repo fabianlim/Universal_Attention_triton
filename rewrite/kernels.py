@@ -214,6 +214,7 @@ def softmax_with_decay_fwd(
     dest: torch.Tensor,
     chunked_decay: torch.Tensor,
     chunk_size: int = CHUNK_SIZE,
+    return_max_denom: bool = False,
     return_decay: bool = False,
     skip_preprocessing: bool = False,
 ):
@@ -244,6 +245,16 @@ def softmax_with_decay_fwd(
         device=q.device, 
         dtype=torch.float32
     ) 
+    res_denom = torch.zeros(
+        (b, nheads, qlen), 
+        device=q.device, 
+        dtype=torch.float32
+    ) 
+    res_max = torch.zeros(
+        (b, nheads, qlen), 
+        device=q.device, 
+        dtype=torch.float32
+    ) 
 
     res_decay = None
     if return_decay:
@@ -255,7 +266,10 @@ def softmax_with_decay_fwd(
         ) 
 
     _softmax_with_decay_fwd[grid](
-        res, res_decay,
+        res, 
+        res_max,
+        res_denom, 
+        res_decay,
         q, k, v, src, dest,
         chunked_decay,
         res.stride(0), res.stride(1), res.stride(2), res.stride(3),
@@ -265,6 +279,8 @@ def softmax_with_decay_fwd(
         chunked_decay.stride(0), chunked_decay.stride(1), chunked_decay.stride(2), chunked_decay.stride(3),
         src.stride(0), src.stride(1), src.stride(2),
         dest.stride(0), dest.stride(1), dest.stride(2),
+        res_max.stride(0), res_max.stride(1), res_max.stride(2),
+        res_denom.stride(0), res_denom.stride(1), res_denom.stride(2),
         *(
             None if res_decay is None else
             res_decay.stride(i)
@@ -275,6 +291,10 @@ def softmax_with_decay_fwd(
         group_size=nheads // kvheads,
         chunk_size=chunk_size,
     )
+
+    if return_max_denom:
+        # this takes precedence over decay
+        return res, res_max, res_denom
 
     if return_decay:
         # NOTE: the upper tril entries not garanteed to be
@@ -290,7 +310,10 @@ def softmax_with_decay_fwd(
 )
 @triton.jit
 def _softmax_with_decay_fwd(
-    res, res_decay,
+    res, 
+    res_max,
+    res_denom, 
+    res_decay,
     queries, keys, values, 
     src, dest,
     chunked_decay, 
@@ -301,6 +324,8 @@ def _softmax_with_decay_fwd(
     d_stride_b, d_stride_h, d_stride_chunk, d_stride_kseq,
     src_stride_b, src_stride_h, src_stride_seq, 
     dest_stride_b, dest_stride_h, dest_stride_seq, 
+    res_max_stride_b, res_max_stride_h, res_max_stride_seq, 
+    res_denom_stride_b, res_denom_stride_h, res_denom_stride_seq, 
     res_decay_stride_b, res_decay_stride_h, res_decay_stride_qseq, 
     res_decay_stride_kseq,
     seqlen: int,
@@ -320,6 +345,8 @@ def _softmax_with_decay_fwd(
 
     # offset by batch and head
     res += pid_b * res_stride_b + pid_h * res_stride_h
+    res_max += pid_b * res_max_stride_b + pid_h * res_max_stride_h
+    res_denom += pid_b * res_denom_stride_b + pid_h * res_denom_stride_h
     queries += pid_b * q_stride_b + pid_h * q_stride_h
     keys += pid_b * k_stride_b + hkv * k_stride_h
     values += pid_b * v_stride_b + hkv * v_stride_h
@@ -332,6 +359,8 @@ def _softmax_with_decay_fwd(
     keys_r = keys + pid_r * chunk_size * k_stride_seq
     queries_r = queries + pid_r * chunk_size * q_stride_seq
     res_r = res + pid_r * chunk_size * res_stride_seq
+    res_max_r = res_max + pid_r * chunk_size * res_max_stride_seq
+    res_denom_r = res_denom + pid_r * chunk_size * res_denom_stride_seq
     dest += pid_r * chunk_size * dest_stride_seq
 
     if res_decay:
@@ -621,3 +650,15 @@ def _softmax_with_decay_fwd(
             (offs_i[:, None] < limit_r)
         )
     )
+
+    tl.store(
+        res_max_r + offs_i * res_max_stride_seq,
+        score_max,
+        mask=offs_i < limit_r
+    )
+    tl.store(
+        res_denom_r + offs_i * res_denom_stride_seq,
+        score_denom,
+        mask=offs_i < limit_r
+    )
+

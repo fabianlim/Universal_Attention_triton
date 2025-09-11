@@ -7,7 +7,7 @@ import torch
 def _backward_slow_draft(
     dout, k, v, q, src, dest, 
     decay_chunks, # unused
-    score_max, score_denom, # unused
+    score_denom, # unused
 ):
     # L2-normalize K
     k = k/k.pow(2).sum(-1,True).sqrt().add(1e-6)
@@ -168,7 +168,7 @@ def _backward_slow_draft(
 
 def _backward_slow_parallelizable(
     dout, k, v, q, src, dest, chunked_decay,
-    score_denom, score_max,
+    score_denom,
     chunk_size=CHUNK_SIZE,
 ):
     # L2-normalize K
@@ -256,19 +256,10 @@ def _backward_slow_parallelizable(
         ].matmul(
             k.transpose(-1,-2)
         ).add(decay)
-        denom = (
-            score_max[
-                ..., 
-                i*chunk_size:(i+1)*chunk_size,
-            ]
-            +
-            torch.log(
-                score_denom[
-                    ..., 
-                    i*chunk_size:(i+1)*chunk_size,
-                ]
-            )
-        )
+        denom = score_denom[
+            ..., 
+            i*chunk_size:(i+1)*chunk_size,
+        ]
         score = logits.sub(denom.unsqueeze(-1))
         score = score.exp()
 
@@ -349,10 +340,7 @@ def _backward_slow_parallelizable(
 
         # take the denom from store
         score = logits.sub(
-            (
-                score_max
-                + torch.log(score_denom)
-            ).unsqueeze(-1)
+            score_denom.unsqueeze(-1)
         )
         score = score.exp()
         
@@ -458,16 +446,16 @@ class UniversalAttention(Function):
         decay_chunks = decay_chunks.cumsum(-2)
 
         # Pass2: run the softmax
-        o, score_max, score_denom = softmax_with_decay_fwd(
+        o, score_denom = softmax_with_decay_fwd(
             q, k, v, 
             src, dest, 
             decay_chunks,
-            return_max_denom=True,
+            return_denom=True,
         )
 
         ctx.save_for_backward(
             k, v, q, src, dest, decay_chunks,
-            score_max, score_denom,
+            score_denom,
         )
 
         return o
@@ -478,7 +466,7 @@ class UniversalAttention(Function):
 
         (
             k, v, q, src, dest, decay_chunks,
-            score_max, score_denom,
+            score_denom,
         ) = ctx.saved_tensors
 
         dK, dV, dQ, dsrc, ddest = _backward_slow_draft(
@@ -486,7 +474,7 @@ class UniversalAttention(Function):
             k, v, q, 
             src.sigmoid(), dest.sigmoid(),
             decay_chunks,
-            score_max, score_denom,
+            score_denom,
         )
         
         # NOTE: since we accepted src and dest befor ethe sigmoid

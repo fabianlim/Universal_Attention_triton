@@ -7,6 +7,7 @@ import torch
 def _backward_slow_draft(
     dout, k, v, q, src, dest, 
     decay_chunks, # unused
+    score_max, score_denom, # unused
 ):
     # L2-normalize K
     k = k/k.pow(2).sum(-1,True).sqrt().add(1e-6)
@@ -167,6 +168,7 @@ def _backward_slow_draft(
 
 def _backward_slow_parallelizable(
     dout, k, v, q, src, dest, chunked_decay,
+    score_denom, score_max,
     chunk_size=CHUNK_SIZE,
 ):
     # L2-normalize K
@@ -199,7 +201,6 @@ def _backward_slow_parallelizable(
     # can be computed in parallel using
     # l / chunks_size instances
     dZscore_store = []
-    denom_store = []
     outputs_dQ = []
     for i in range(0, l // chunk_size):  
         # - compute the delay across the chunked rows
@@ -255,11 +256,21 @@ def _backward_slow_parallelizable(
         ].matmul(
             k.transpose(-1,-2)
         ).add(decay)
-        denom = logits.logsumexp(dim=-1)
+        denom = (
+            score_max[
+                ..., 
+                i*chunk_size:(i+1)*chunk_size,
+            ]
+            +
+            torch.log(
+                score_denom[
+                    ..., 
+                    i*chunk_size:(i+1)*chunk_size,
+                ]
+            )
+        )
         score = logits.sub(denom.unsqueeze(-1))
         score = score.exp()
-
-        denom_store.append(denom.unsqueeze(-1)) # store for later
 
         # dZ
         dZ = dout[
@@ -281,8 +292,6 @@ def _backward_slow_parallelizable(
 
     # from the column summaries
     dZscore_store = torch.concat(dZscore_store, dim=-2)
-    # - this one should already have from the forward
-    denom_store = torch.concat(denom_store, dim=-2)
     outputs_dV = []
     outputs_dK_1 = []
     outputs_dK_2 = []
@@ -339,7 +348,12 @@ def _backward_slow_parallelizable(
         ).add(decay)
 
         # take the denom from store
-        score = logits.sub(denom_store)
+        score = logits.sub(
+            (
+                score_max
+                + torch.log(score_denom)
+            ).unsqueeze(-1)
+        )
         score = score.exp()
         
         # - dV
@@ -444,14 +458,16 @@ class UniversalAttention(Function):
         decay_chunks = decay_chunks.cumsum(-2)
 
         # Pass2: run the softmax
-        o = softmax_with_decay_fwd(
+        o, score_max, score_denom = softmax_with_decay_fwd(
             q, k, v, 
             src, dest, 
             decay_chunks,
+            return_max_denom=True,
         )
 
         ctx.save_for_backward(
             k, v, q, src, dest, decay_chunks,
+            score_max, score_denom,
         )
 
         return o
@@ -462,6 +478,7 @@ class UniversalAttention(Function):
 
         (
             k, v, q, src, dest, decay_chunks,
+            score_max, score_denom,
         ) = ctx.saved_tensors
 
         dK, dV, dQ, dsrc, ddest = _backward_slow_draft(
@@ -469,6 +486,7 @@ class UniversalAttention(Function):
             k, v, q, 
             src.sigmoid(), dest.sigmoid(),
             decay_chunks,
+            score_max, score_denom,
         )
         
         # NOTE: since we accepted src and dest befor ethe sigmoid

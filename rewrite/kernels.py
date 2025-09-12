@@ -377,7 +377,6 @@ def _softmax_with_decay_fwd(
     offs_i = tl.arange(0, chunk_size)
     offs_j = tl.arange(0, BLOCK_C) # columns
     offs_d = tl.arange(0, BLOCK_D)
-    offs_d = tl.arange(0, BLOCK_D)
     offs_v = tl.arange(0, HEAD_DIM)
     limit_r = seqlen - pid_r * chunk_size # row limit
     limit_c = seqlen # col_limit
@@ -648,3 +647,422 @@ def _softmax_with_decay_fwd(
         mask=offs_i < limit_r
     )
 
+def rowwise_bwd(
+    dout: torch.Tensor, # b,h,l,d
+    q: torch.Tensor, # b,h,l,d
+    k: torch.Tensor, # b,h,l,d
+    v: torch.Tensor, # b,h,l,d
+    src: torch.Tensor,
+    dest: torch.Tensor,
+    chunked_decay: torch.Tensor,
+    score_denom: torch.Tensor,
+    chunk_size: int = CHUNK_SIZE,
+    skip_preprocessing: bool = False,
+):
+    # TODO: check sizes
+    b, nheads, qlen, qdim = q.shape
+    _, kvheads, klen, _ = k.shape
+    _, _, _, vdim = v.shape
+    assert qlen == klen
+    assert nheads % kvheads == 0
+    assert qdim == vdim
+
+    grid = (b, nheads, triton.cdiv(qlen, chunk_size))
+
+    if not skip_preprocessing:
+        # NOTE: move this somewhere?
+        # L2-normalize K
+        k = k / k.pow(2).sum(-1,True).sqrt().add(1e-6)
+
+        # sigmoid
+        src = src.sigmoid()
+        dest = dest.sigmoid()
+
+        # NOTE: 
+        # - static_src and static_dest assumed to be sigmoided
+
+    res_dQ = torch.zeros(
+        (b, nheads, qlen, qdim), 
+        device=q.device, 
+        dtype=torch.float32
+    ) 
+
+    res_dZscore = torch.zeros(
+        (b, nheads, qlen), 
+        device=q.device, 
+        dtype=torch.float32
+    ) 
+
+    _rowwise_bwd[grid](
+        res_dQ, 
+        res_dZscore,
+        dout, q, k, v, src, dest,
+        chunked_decay,
+        score_denom,
+        res_dQ.stride(0), res_dQ.stride(1), res_dQ.stride(2), res_dQ.stride(3),
+        res_dZscore.stride(0), res_dZscore.stride(1), res_dZscore.stride(2), 
+        dout.stride(0), dout.stride(1), dout.stride(2), dout.stride(3),
+        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+        chunked_decay.stride(0), chunked_decay.stride(1), chunked_decay.stride(2), chunked_decay.stride(3),
+        src.stride(0), src.stride(1), src.stride(2),
+        dest.stride(0), dest.stride(1), dest.stride(2),
+        seqlen=klen,
+        HEAD_DIM=qdim,
+        group_size=nheads // kvheads,
+        chunk_size=chunk_size,
+    )
+
+    return res_dQ, res_dZscore
+
+@triton.autotune(
+    [
+        triton.Config({'BLOCK_C': 16, 'BLOCK_D': 16}, num_stages=1, num_warps=1),
+    ],
+    key=['BLOCK_C', 'BLOCK_D'],
+)
+@triton.jit
+def _rowwise_bwd(
+    res_dQ, 
+    res_dZsc,
+    dout, 
+    queries, keys, values, 
+    src, dest,
+    chunked_decay, 
+    dZScore_denom,
+    res_dQ_stride_b, res_dQ_stride_h, res_dQ_stride_qseq, 
+    res_dQ_stride_dim,
+    res_dZsc_stride_b, res_dZsc_stride_h, res_dZsc_stride_seq, 
+    do_stride_b, do_stride_h, do_stride_seq, do_stride_dim,
+    q_stride_b, q_stride_h, q_stride_seq, q_stride_dim,
+    k_stride_b, k_stride_h, k_stride_seq, k_stride_dim,
+    v_stride_b, v_stride_h, v_stride_seq, v_stride_dim,
+    d_stride_b, d_stride_h, d_stride_chunk, d_stride_kseq,
+    src_stride_b, src_stride_h, src_stride_seq, 
+    dest_stride_b, dest_stride_h, dest_stride_seq, 
+    seqlen: int,
+    group_size: int,
+    chunk_size: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+
+    pid_b = tl.program_id(0) # batch
+    pid_h = tl.program_id(1) # query head
+    hkv = pid_h // group_size # key / value head
+    pid_r = tl.program_id(2) # row chunk
+
+    # offset by batch and head
+    res_dQ += pid_b * res_dQ_stride_b + pid_h * res_dQ_stride_h
+    res_dZsc += pid_b * res_dZsc_stride_b + pid_h * res_dZsc_stride_h
+    dout += pid_b * do_stride_b + pid_h * do_stride_h
+    queries += pid_b * q_stride_b + pid_h * q_stride_h
+    keys += pid_b * k_stride_b + hkv * k_stride_h
+    values += pid_b * v_stride_b + hkv * v_stride_h
+    chunked_decay += pid_b * d_stride_b + hkv * d_stride_h
+    dZScore_denom += pid_b * res_dZsc_stride_b + hkv * res_dZsc_stride_h
+
+    src += pid_b * src_stride_b + hkv * src_stride_h
+    dest += pid_b * dest_stride_b + hkv * dest_stride_h
+
+    # keys (row) and dest will be offset by chunk
+    keys_r = keys + pid_r * chunk_size * k_stride_seq
+    queries_r = queries + pid_r * chunk_size * q_stride_seq
+    dout_r = dout + pid_r * chunk_size * do_stride_seq
+    denom_r = dZScore_denom + pid_r * chunk_size * res_dZsc_stride_seq
+    res_dQ_r = res_dQ + pid_r * chunk_size * res_dQ_stride_qseq
+    res_dZsc_r = res_dZsc + pid_r * chunk_size * res_dZsc_stride_seq
+    dest += pid_r * chunk_size * dest_stride_seq
+
+    # decay offset by chunk index
+    decay_prev_chunk = chunked_decay # Need to set this otherwise I cannot
+    if pid_r > 0:
+        # get the previous row
+        decay_prev_chunk += (pid_r-1) * d_stride_chunk
+
+    # we allow row chunk size to differ from column chunk,
+    # so we 
+    # - a the pid_r-th row chunk will take up (pid_r * chunk_size) columns
+    # - so 
+    nC = tl.cdiv(
+        (pid_r + 1) * chunk_size - 1, BLOCK_C
+    ) # number of column chunks to process (including the spillover)
+    nD = tl.cdiv(HEAD_DIM, BLOCK_D)
+
+    # load scales
+    # qk_scale = 1.44269504  # 1/log(2)
+    offs_i = tl.arange(0, chunk_size)
+    offs_j = tl.arange(0, BLOCK_C) # columns
+    offs_d = tl.arange(0, BLOCK_D)
+    offs_v = tl.arange(0, HEAD_DIM)
+    limit_r = seqlen - pid_r * chunk_size # row limit
+    limit_c = seqlen # col_limit
+
+    # computation of dQ
+    # - f
+    dZScore_sum = tl.zeros([chunk_size], dtype=tl.float32)
+    # TODO: its not gauranteed that value dim 
+    # equals to query and key dim
+    acc = tl.zeros([chunk_size, HEAD_DIM], dtype=tl.float32)
+    acc2 = tl.zeros([chunk_size, HEAD_DIM], dtype=tl.float32)
+
+    # load the dest
+    dest_vec = tl.load(
+        dest + offs_i * dest_stride_seq,
+        mask=offs_i < limit_r,
+        other=0.0,
+    ).to(tl.float32)
+    dest_vec = tl.exp2(tl.log2(dest_vec) / 3.0) # pow (1/3)
+
+    # load the denom
+    denom_vec = tl.load(
+        denom_r + offs_i * res_dZsc_stride_seq,
+        mask=offs_i < limit_r,
+        other=0.0,
+    ).to(tl.float32)
+
+    # process the columns
+    for c in range(0, nC):
+
+        affinity = tl.zeros((chunk_size, BLOCK_C), dtype=tl.float32)
+        score = tl.zeros((chunk_size, BLOCK_C), dtype=tl.float32)
+        dZ = tl.zeros((chunk_size, BLOCK_C), dtype=tl.float32)
+
+        # -------dY,dQ, dZ,dZScore -------
+
+        # compute the keys (tiled on dimension)
+        limit_d = HEAD_DIM # dims
+        k_mat_ptr = keys_r 
+        q_mat_ptr = queries_r 
+        do_mat_ptr = dout_r
+        kt_mat_ptr = keys
+        vt_mat_ptr = values
+        kc_mat_ptr = keys
+
+        for _ in range(0, nD):
+
+            # TODO: for the last block need to do the triangular masking
+            # NOTE: this row load can actually be optimized
+            # - since its repetitive, especially in the case nD == 1
+            # - for decay
+            k_mat = tl.load(
+                (
+                    k_mat_ptr 
+                    + offs_i[:, None] * k_stride_seq
+                    + offs_d[None, :] * k_stride_dim
+                ),
+                mask=(offs_i[:, None] < limit_r) & (offs_d[None, :] < limit_d), 
+                other=0.0
+            ).to(tl.float32)
+
+            # for score -> dY
+            q_mat = tl.load(
+                (
+                    q_mat_ptr 
+                    + offs_i[:, None] * q_stride_seq
+                    + offs_d[None, :] * q_stride_dim
+                ),
+                mask=(offs_i[:, None] < limit_r) & (offs_d[None, :] < limit_d), 
+                other=0.0
+            ).to(tl.float32)
+
+            # for decay
+            kt_mat = tl.load(
+                (
+                    kt_mat_ptr 
+                    + offs_d[:, None] * k_stride_dim
+                    + offs_j[None, :] * k_stride_seq
+                ),
+                mask= (offs_d[:, None] < limit_d) & (offs_j[None, :] < limit_c),
+                other=0.0
+            ).to(tl.float32)
+
+            # for dz
+            # NOTE: we assme now dim(do) = dim(v) = HEAD_DIM
+            do_mat = tl.load(
+                (
+                    do_mat_ptr 
+                    + offs_i[:, None] * do_stride_seq
+                    + offs_d[None, :] * do_stride_dim
+                ),
+                mask=(offs_i[:, None] < limit_r) & (offs_d[None, :] < limit_d), 
+                other=0.0
+            ).to(tl.float32)
+
+            # for dZ
+            vt_mat = tl.load(
+                (
+                    vt_mat_ptr 
+                    + offs_d[:, None] * v_stride_dim
+                    + offs_j[None, :] * v_stride_seq
+                ),
+                mask= (offs_d[:, None] < limit_d) & (offs_j[None, :] < limit_c),
+                other=0.0
+            ).to(tl.float32)
+
+            # TODO: handle precision
+            affinity += tl.dot(k_mat, kt_mat)
+            score += tl.dot(q_mat, kt_mat)
+            dZ += tl.dot(do_mat, vt_mat)
+
+            # handle the limit
+            limit_d -= BLOCK_D
+
+            # handle the pointers
+            k_mat_ptr += BLOCK_D * k_stride_dim
+            kt_mat_ptr += BLOCK_D * k_stride_dim
+            q_mat_ptr += BLOCK_D * k_stride_dim
+            do_mat_ptr += BLOCK_D * k_stride_dim
+
+        # .relu().pow(2/3)
+        affinity = tl.exp2(tl.log2(tl.maximum(affinity, 0.0)) * 2.0 / 3.0)
+
+        # load the src
+        src_vec = tl.load(
+            src + offs_j * src_stride_seq,
+            mask=offs_j < limit_c,
+            other=0.0,
+        ).to(tl.float32)
+        src_vec = tl.exp2(tl.log2(src_vec) / 3.0) # pow (1/3)
+        affinity = affinity * dest_vec[:, None] * src_vec[None, :]
+
+        # - convert to log(1-p)
+        # torch.log1p(affinity.clamp(min=0, max=1-1e-6).neg())
+        decay = tl.log(1.0 - tl.clamp(affinity, 0.0, 1.0 - 1e-6)) 
+
+        # SEE notes on this in the _chunked_delay kernel
+        # if the rightmost element of the block
+        # is greater
+        offset = c * BLOCK_C - pid_r * chunk_size
+        if offset >= 0 and chunk_size >= offset:
+            decay = tl.where(
+                (offs_i[:, None] > (offs_j[None, :] + offset)), 
+                decay, 
+                0.0 # dont set this to -inf yet because we need to cumsum
+            )
+
+        # cumsum over the chunk rows
+        decay = tl.cumsum(decay, axis=-2)
+
+        offset = pid_r * chunk_size - c * BLOCK_C 
+        # if decay_prev and offset > 0:
+        if pid_r > 0 and offset > 0:
+            decay_boundary = tl.load(
+                (decay_prev_chunk + offs_j[None,:]),
+                mask=(
+                    offs_j[None, :] < offset
+                ),
+                other=0.0,
+            ).to(tl.float32)
+
+            # hopefully this can distribute across
+            # rows
+            decay += decay_boundary
+
+            # increment pointer
+            decay_prev_chunk += BLOCK_C * d_stride_kseq
+
+        # NOTE: see above notes
+        offset = c * BLOCK_C - pid_r * chunk_size
+        if offset >= 0 and chunk_size >= offset:
+            decay = tl.where(
+                (offs_i[:, None] >= (offs_j[None, :] + offset)), 
+                decay, 
+                - float("inf"), # not set it to inf
+            )
+
+        # ---------- COMPUTE dZScore -------------
+        score += decay
+        score -= denom_vec[:, None] # take into account the denominator
+
+        # - need to do this for the last chunk ends
+        # - so that the below tl.sum(score) will not 
+        #   take those values into account
+        #  x x x |  0    0
+        #  x x x |  0    0 
+        #  0 0 0 |  0    0 
+
+        # NO NEED FOR this since dZ = dout @ vT will have zeros
+        # in the right places (thanks to tl.load)
+        # - but just handle it in the score
+
+        if limit_c < BLOCK_C:
+            score = tl.where(
+                offs_j[None, :] < limit_c,
+                score, 0.
+            )
+
+        if limit_r < chunk_size:
+            score = tl.where(
+                offs_i[:, None] < limit_r,
+                score, 0.0
+            )
+
+        # we need to compute 
+        # _dzScore = (dZ * score).sum(-1, keepdim=True) # see notes above
+        # dY = score * (dZ - _dzScore)
+        #    = dZScore - score * _dzScore
+        # we accum score * dZ and score * _dzScore seperately
+
+        dZScore = dZ * tl.exp(score)
+        dZScore_prev_sum = dZScore_sum
+        dZScore_sum += tl.sum(dZScore, axis=1)
+
+        k_mat = tl.load(
+            (
+                kc_mat_ptr 
+                + offs_j[:, None] * k_stride_seq
+                + offs_v[None, :] * k_stride_dim # NOTE: assumed same
+            ),
+            mask=(offs_j[:, None] < limit_c),
+            other=0.0
+        ).to(tl.float32)
+
+        # first term (score * dZ)
+        # - dZ should have the appropriate zeros in the boundary
+        acc += tl.dot(
+            dZScore, k_mat
+        )
+
+        # secod term score * (dZ * score).sum(-1)
+        if c > 0:
+            ratio = (
+                dZScore_sum / dZScore_prev_sum
+            )
+            acc2 *= ratio[:, None]
+
+        acc2 += tl.dot(
+            tl.exp(score) * dZScore_sum[:, None], 
+            k_mat
+        )
+
+        # move pointer with column chunk
+        keys += BLOCK_C * k_stride_seq
+        values += BLOCK_C * v_stride_seq
+        src += BLOCK_C * src_stride_seq
+
+        # handle the limit
+        limit_c -= BLOCK_C
+
+    # -  DONE WITH COL CHUNK LOOPS - 
+
+    tl.store(
+        (
+            res_dQ_r 
+            + offs_i[:, None] * res_dQ_stride_qseq
+            + offs_v[None, :] * res_dQ_stride_dim
+        ),
+        acc - acc2, 
+        mask=(
+            (offs_i[:, None] < limit_r)
+        )
+    )
+
+    # this is the dZScore sum
+    tl.store(
+        res_dZsc_r + offs_i * res_dZsc_stride_seq,
+        dZScore_sum,
+        mask=offs_i < limit_r
+    )

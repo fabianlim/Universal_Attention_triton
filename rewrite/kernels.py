@@ -693,29 +693,42 @@ def rowwise_bwd(
         dtype=torch.float32
     ) 
 
-    _rowwise_bwd[grid](
-        res_dQ, 
-        res_dZscore,
-        dout, q, k, v, src, dest,
-        chunked_decay,
-        score_denom,
-        res_dQ.stride(0), res_dQ.stride(1), res_dQ.stride(2), res_dQ.stride(3),
-        res_dZscore.stride(0), res_dZscore.stride(1), res_dZscore.stride(2), 
-        dout.stride(0), dout.stride(1), dout.stride(2), dout.stride(3),
-        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-        chunked_decay.stride(0), chunked_decay.stride(1), chunked_decay.stride(2), chunked_decay.stride(3),
-        score_denom.stride(0), score_denom.stride(1), score_denom.stride(2),
-        src.stride(0), src.stride(1), src.stride(2),
-        dest.stride(0), dest.stride(1), dest.stride(2),
-        seqlen=klen,
-        HEAD_DIM=qdim,
-        group_size=nheads // kvheads,
-        chunk_size=chunk_size,
-    )
+    num_chunks = triton.cdiv(qlen, chunk_size)
+    res_dY_chunked = torch.zeros(
+        (b, nheads, num_chunks, qlen), 
+        device=q.device, 
+        dtype=torch.float32
+    ) 
 
-    return res_dQ, res_dZscore
+    # NOTE: need to run this twice, dont have a good way
+    # to get both res_dZscore and res_dY_chunked in a single run
+    for p in [1,2]:
+        _rowwise_bwd[grid](
+            res_dQ, 
+            res_dZscore,
+            res_dY_chunked,
+            dout, q, k, v, src, dest,
+            chunked_decay,
+            score_denom,
+            res_dQ.stride(0), res_dQ.stride(1), res_dQ.stride(2), res_dQ.stride(3),
+            res_dZscore.stride(0), res_dZscore.stride(1), res_dZscore.stride(2), 
+            res_dY_chunked.stride(0), res_dY_chunked.stride(1), res_dY_chunked.stride(2), res_dY_chunked.stride(3),
+            dout.stride(0), dout.stride(1), dout.stride(2), dout.stride(3),
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            chunked_decay.stride(0), chunked_decay.stride(1), chunked_decay.stride(2), chunked_decay.stride(3),
+            score_denom.stride(0), score_denom.stride(1), score_denom.stride(2),
+            src.stride(0), src.stride(1), src.stride(2),
+            dest.stride(0), dest.stride(1), dest.stride(2),
+            seqlen=klen,
+            HEAD_DIM=qdim,
+            group_size=nheads // kvheads,
+            chunk_size=chunk_size,
+            PASS=p,
+        )
+
+    return res_dQ, res_dZscore, res_dY_chunked
 
 @triton.autotune(
     [
@@ -727,6 +740,7 @@ def rowwise_bwd(
 def _rowwise_bwd(
     res_dQ, 
     res_dZsc,
+    res_dYc,
     dout, 
     queries, keys, values, 
     src, dest,
@@ -735,6 +749,7 @@ def _rowwise_bwd(
     res_dQ_stride_b, res_dQ_stride_h, res_dQ_stride_qseq, 
     res_dQ_stride_dim,
     res_dZsc_stride_b, res_dZsc_stride_h, res_dZsc_stride_seq, 
+    res_dYc_stride_b, res_dYc_stride_h, res_dYc_stride_chunk, res_dYc_stride_seq, 
     do_stride_b, do_stride_h, do_stride_seq, do_stride_dim,
     q_stride_b, q_stride_h, q_stride_seq, q_stride_dim,
     k_stride_b, k_stride_h, k_stride_seq, k_stride_dim,
@@ -749,6 +764,7 @@ def _rowwise_bwd(
     BLOCK_C: tl.constexpr,
     BLOCK_D: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    PASS: tl.constexpr,
 ):
 
     pid_b = tl.program_id(0) # batch
@@ -759,6 +775,7 @@ def _rowwise_bwd(
     # offset by batch and head
     res_dQ += pid_b * res_dQ_stride_b + pid_h * res_dQ_stride_h
     res_dZsc += pid_b * res_dZsc_stride_b + pid_h * res_dZsc_stride_h
+    res_dYc += pid_b * res_dYc_stride_b + pid_h * res_dYc_stride_h
     dout += pid_b * do_stride_b + pid_h * do_stride_h
     queries += pid_b * q_stride_b + pid_h * q_stride_h
     keys += pid_b * k_stride_b + hkv * k_stride_h
@@ -776,6 +793,7 @@ def _rowwise_bwd(
     denom_r = score_denom + pid_r * chunk_size * denom_stride_seq
     res_dQ_r = res_dQ + pid_r * chunk_size * res_dQ_stride_qseq
     res_dZsc_r = res_dZsc + pid_r * chunk_size * res_dZsc_stride_seq
+    res_dYc_r = res_dYc + pid_r * res_dYc_stride_chunk
     dest += pid_r * chunk_size * dest_stride_seq
 
     # decay offset by chunk index
@@ -802,13 +820,29 @@ def _rowwise_bwd(
     limit_r = seqlen - pid_r * chunk_size # row limit
     limit_c = seqlen # col_limit
 
-    # computation of dQ
-    # - f
-    dZScore_sum = tl.zeros([chunk_size], dtype=tl.float32)
-    # TODO: its not gauranteed that value dim 
-    # equals to query and key dim
-    acc = tl.zeros([chunk_size, HEAD_DIM], dtype=tl.float32)
-    acc2 = tl.zeros([chunk_size, HEAD_DIM], dtype=tl.float32)
+    # we need two passes 
+    if PASS == 1:
+        # in the first pass we compute dZScore
+        dZScore_sum = tl.zeros([chunk_size], dtype=tl.float32)
+
+        # computation of dQ
+        # TODO: its not gauranteed that value dim 
+        # equals to query and key dim
+        acc = tl.zeros([chunk_size, HEAD_DIM], dtype=tl.float32)
+        acc2 = tl.zeros([chunk_size, HEAD_DIM], dtype=tl.float32)
+
+    elif PASS == 2:
+        # in the 2nd pass we load dZScore
+        # to compute dY_chunked
+        dZScore_sum = tl.load(
+            res_dZsc_r + offs_i * res_dZsc_stride_seq,
+            mask=offs_i < limit_r,
+            other=0.0,
+        ).to(tl.float32)
+
+        # not needed
+        acc = None
+        acc2 = None
 
     # load the dest
     dest_vec = tl.load(
@@ -1003,72 +1037,101 @@ def _rowwise_bwd(
                 score, 0.0
             )
 
-        # we need to compute 
-        # _dzScore = (dZ * score).sum(-1, keepdim=True) # see notes above
-        # dY = score * (dZ - _dzScore)
-        #    = dZScore - score * _dzScore
-        # we accum score * dZ and score * _dzScore seperately
-
+        # dZScore
         dZScore = dZ * tl.exp(score)
-        dZScore_prev_sum = dZScore_sum
-        dZScore_sum += tl.sum(dZScore, axis=1)
 
-        k_mat = tl.load(
-            (
-                kc_mat_ptr 
-                + offs_j[:, None] * k_stride_seq
-                + offs_v[None, :] * k_stride_dim # NOTE: assumed same
-            ),
-            mask=(offs_j[:, None] < limit_c),
-            other=0.0
-        ).to(tl.float32)
+        if PASS == 1:
+            # - in pass 1, we compute 
+            # dZScore and dQ (see acc, acc2)
+            # in an online approach
 
-        # first term (score * dZ)
-        # - dZ should have the appropriate zeros in the boundary
-        acc += tl.dot(
-            dZScore, k_mat
-        )
+            # we need to compute 
+            # _dzScore = (dZ * score).sum(-1, keepdim=True) # see notes above
+            # dY = score * (dZ - _dzScore)
+            #    = dZScore - score * _dzScore
+            # we accum score * dZ and score * _dzScore seperately
+            dZScore_prev_sum = dZScore_sum
+            dZScore_sum += tl.sum(dZScore, axis=1)
 
-        # secod term score * (dZ * score).sum(-1)
-        if c > 0:
-            ratio = (
-                dZScore_sum / dZScore_prev_sum
+            k_mat = tl.load(
+                (
+                    kc_mat_ptr 
+                    + offs_j[:, None] * k_stride_seq
+                    + offs_v[None, :] * k_stride_dim # NOTE: assumed same
+                ),
+                mask=(offs_j[:, None] < limit_c),
+                other=0.0
+            ).to(tl.float32)
+
+            # first term (score * dZ)
+            # - dZ should have the appropriate zeros in the boundary
+            acc += tl.dot(
+                dZScore, k_mat
             )
-            acc2 *= ratio[:, None]
 
-        acc2 += tl.dot(
-            tl.exp(score) * dZScore_sum[:, None], 
-            k_mat
-        )
+            # secod term score * (dZ * score).sum(-1)
+            if c > 0:
+                ratio = (
+                    dZScore_sum / dZScore_prev_sum
+                )
+                acc2 *= ratio[:, None]
+
+            acc2 += tl.dot(
+                tl.exp(score) * dZScore_sum[:, None], 
+                k_mat
+            )
+        elif PASS == 2:
+
+            # in pass 2, we compute the chunked
+            # dY, 
+            # NOTE: we need two passes as there
+            # is no good way to compute this sum
+            # while simultanously computing dZScore_sum
+            
+            # store the quantities for dY
+            tl.store(
+                res_dYc_r + offs_j * res_dYc_stride_seq, 
+                tl.sum(
+                    (
+                        dZScore 
+                        - tl.exp(score) * dZScore_sum[:, None]
+                    ),
+                    axis=-2
+                ),
+                mask=offs_j < limit_c
+            )
 
         # move pointer with column chunk
         keys += BLOCK_C * k_stride_seq
         values += BLOCK_C * v_stride_seq
         src += BLOCK_C * src_stride_seq
+        res_dYc_r += BLOCK_C * res_dYc_stride_seq
 
         # handle the limit
         limit_c -= BLOCK_C
 
     # -  DONE WITH COL CHUNK LOOPS - 
 
-    tl.store(
-        (
-            res_dQ_r 
-            + offs_i[:, None] * res_dQ_stride_qseq
-            + offs_v[None, :] * res_dQ_stride_dim
-        ),
-        acc - acc2, 
-        mask=(
-            (offs_i[:, None] < limit_r)
+    if PASS == 1:
+        # in PASS 1 we compute dQ 
+        tl.store(
+            (
+                res_dQ_r 
+                + offs_i[:, None] * res_dQ_stride_qseq
+                + offs_v[None, :] * res_dQ_stride_dim
+            ),
+            acc - acc2, 
+            mask=(
+                (offs_i[:, None] < limit_r)
+            )
         )
-    )
 
-    # this is the dZScore sum
-    tl.store(
-        res_dZsc_r + offs_i * res_dZsc_stride_seq,
-        dZScore_sum,
-        mask=offs_i < limit_r
-    )
+        # we also output dZScore_sum
+        tl.store(
+            res_dZsc_r + offs_i * res_dZsc_stride_seq,
+            dZScore_sum,
+            mask=offs_i < limit_r
+        )
 
 def colwise_bwd(
     dout: torch.Tensor, # b,h,l,d

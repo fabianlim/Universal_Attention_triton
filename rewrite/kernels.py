@@ -687,6 +687,12 @@ def rowwise_bwd(
         dtype=torch.float32
     ) 
 
+    res_dK1 = torch.zeros(
+        (b, nheads, klen, qdim), 
+        device=q.device, 
+        dtype=torch.float32
+    ) 
+
     res_dZscore = torch.zeros(
         (b, nheads, qlen), 
         device=q.device, 
@@ -717,6 +723,7 @@ def rowwise_bwd(
 
         _rowwise_bwd[grid](
             res_dQ, 
+            res_dK1,
             res_dZscore,
             res_dY_chunked,
             res_ddest,
@@ -724,6 +731,7 @@ def rowwise_bwd(
             chunked_decay,
             score_denom,
             res_dQ.stride(0), res_dQ.stride(1), res_dQ.stride(2), res_dQ.stride(3),
+            res_dK1.stride(0), res_dK1.stride(1), res_dK1.stride(2), res_dK1.stride(3),
             res_dZscore.stride(0), res_dZscore.stride(1), res_dZscore.stride(2), 
             res_dY_chunked.stride(0), res_dY_chunked.stride(1), res_dY_chunked.stride(2), res_dY_chunked.stride(3),
             res_ddest.stride(0), res_ddest.stride(1), res_ddest.stride(2),
@@ -742,7 +750,7 @@ def rowwise_bwd(
             PASS=p,
         )
 
-    return res_dQ, res_dZscore, res_dY_chunked, res_ddest
+    return res_dQ, res_dK1, res_dZscore, res_dY_chunked, res_ddest
 
 @triton.autotune(
     [
@@ -753,6 +761,7 @@ def rowwise_bwd(
 @triton.jit
 def _rowwise_bwd(
     res_dQ, 
+    res_dK1, 
     res_dZsc,
     res_dYc,
     res_ddest,
@@ -763,6 +772,8 @@ def _rowwise_bwd(
     score_denom,
     res_dQ_stride_b, res_dQ_stride_h, res_dQ_stride_qseq, 
     res_dQ_stride_dim,
+    res_dK1_stride_b, res_dK1_stride_h, res_dK1_stride_seq, 
+    res_dK1_stride_dim,
     res_dZsc_stride_b, res_dZsc_stride_h, res_dZsc_stride_seq, 
     res_dYc_stride_b, res_dYc_stride_h, res_dYc_stride_chunk, res_dYc_stride_seq, 
     res_dd_stride_b, res_dd_stride_h, res_dd_stride_seq, 
@@ -790,6 +801,7 @@ def _rowwise_bwd(
 
     # offset by batch and head
     res_dQ += pid_b * res_dQ_stride_b + pid_h * res_dQ_stride_h
+    res_dK1 += pid_b * res_dK1_stride_b + pid_h * res_dK1_stride_h
     res_dZsc += pid_b * res_dZsc_stride_b + pid_h * res_dZsc_stride_h
     res_dYc += pid_b * res_dYc_stride_b + pid_h * res_dYc_stride_h
     res_ddest += pid_b * res_dd_stride_b + pid_h * res_dd_stride_h
@@ -809,6 +821,7 @@ def _rowwise_bwd(
     dout_r = dout + pid_r * chunk_size * do_stride_seq
     denom_r = score_denom + pid_r * chunk_size * denom_stride_seq
     res_dQ_r = res_dQ + pid_r * chunk_size * res_dQ_stride_qseq
+    res_dK1_r = res_dK1 + pid_r * chunk_size * res_dK1_stride_seq
     res_dZsc_r = res_dZsc + pid_r * chunk_size * res_dZsc_stride_seq
     res_dYc_r = res_dYc + pid_r * res_dYc_stride_chunk
     res_dd_r = res_ddest + pid_r * chunk_size * res_dd_stride_seq
@@ -849,6 +862,7 @@ def _rowwise_bwd(
         acc = tl.zeros([chunk_size, HEAD_DIM], dtype=tl.float32)
         acc2 = tl.zeros([chunk_size, HEAD_DIM], dtype=tl.float32)
         acc3 = None
+        acc4 = None
 
     elif PASS == 2:
         # in the 2nd pass we load dZScore
@@ -863,6 +877,7 @@ def _rowwise_bwd(
         acc = None
         acc2 = None
         acc3 = None
+        acc4 = None
 
     elif PASS == 3:
 
@@ -880,6 +895,8 @@ def _rowwise_bwd(
 
         # for ddest
         acc3 = tl.zeros([chunk_size], dtype=tl.float32)
+        acc4 = tl.zeros([chunk_size, HEAD_DIM], dtype=tl.float32)
+
 
     # load the dest
     dest_vec = tl.load(
@@ -990,8 +1007,9 @@ def _rowwise_bwd(
             do_mat_ptr += BLOCK_D * do_stride_dim
             vt_mat_ptr += BLOCK_D * v_stride_dim
 
+        affinity0 = affinity # store
         # .relu().pow(2/3)
-        affinity = tl.exp2(tl.log2(tl.maximum(affinity, 0.0)) * 2.0 / 3.0)
+        affinity1 = tl.exp2(tl.log2(tl.maximum(affinity, 0.0)) * 2.0 / 3.0)
 
         # load the src
         src_vec = tl.load(
@@ -1000,7 +1018,7 @@ def _rowwise_bwd(
             other=0.0,
         ).to(tl.float32)
         src_vec = tl.exp2(tl.log2(src_vec) / 3.0) # pow (1/3)
-        affinity = affinity * dest_vec[:, None] * src_vec[None, :]
+        affinity = affinity1 * dest_vec[:, None] * src_vec[None, :]
 
         # - convert to log(1-p)
         # torch.log1p(affinity.clamp(min=0, max=1-1e-6).neg())
@@ -1185,6 +1203,7 @@ def _rowwise_bwd(
             #         = - dZ1 * x^3 / (3 * x^2 (1-x) * dest)
             #         = - dZ1 * x / (3 * (1-x) * dest)
 
+            # - for ddest
             A = -dZ1 / 3 * tl.exp(
                 tl.log(tl.clamp(affinity, 1e-4, 1.0))
 
@@ -1197,6 +1216,46 @@ def _rowwise_bwd(
 
             # ddest needs to be reduced over cols
             acc3 += tl.sum(A, axis=-1)
+
+            # for dK1
+            # dZ3 = torch.where(
+            #     deltanet >= 0,
+            #     2 * dZ2 * ds * deltanet,
+            #     0.
+            # ) # b,h,l,l
+
+            # - recall above affinity0 is deltanet
+            # - affinity1 is deltanet_relu2
+            # dZ2 * ds * deltanet
+            #  = - dZ1 * x^3 * (deltanet) / (3 * term * deltanet_relu2)
+            B = -dZ1 * 2 / 3 * tl.exp(
+                tl.log(tl.clamp(affinity, 1e-4, 1.0))
+
+                # this is not decay
+                - tl.log(1.0 - tl.clamp(affinity, 0.0, 1.0 - 1e-6)) 
+
+                # recall it had pow(1/3) applied
+                - 3 * tl.log(tl.clamp(affinity1, 1e-4, 1.0)) 
+            ) 
+
+            # this is 2 * dZ3
+            B *= tl.where(
+                affinity0 >= 0,
+                2 * affinity0, 0.
+            )
+
+            k_mat = tl.load(
+                (
+                    keys 
+                    + offs_j[:, None] * v_stride_seq
+                    + offs_v[None, :] * v_stride_dim
+                ),
+                mask=(offs_j[:, None] < limit_c),
+                other=0.0
+            ).to(tl.float32)
+
+            # dK1
+            acc4 += tl.dot(B, k_mat)
 
             # if pid_r == 0 and pid_h == 0 and c == 0:
             #     # print ("dZ1", dZ1)
@@ -1234,10 +1293,25 @@ def _rowwise_bwd(
             mask=offs_i < limit_r
         )
     elif PASS == 3:
+        # in pass 3 we compute
+        # ddest
         tl.store(
             res_dd_r + offs_i * res_dd_stride_seq,
             acc3,
             mask=offs_i < limit_r
+        )
+
+        # dK1
+        tl.store(
+            (
+                res_dK1_r 
+                + offs_i[:, None] * res_dK1_stride_seq
+                + offs_v[None, :] * res_dK1_stride_dim
+            ),
+            acc4,
+            mask=(
+                (offs_i[:, None] < limit_r)
+            )
         )
 
 def colwise_bwd(

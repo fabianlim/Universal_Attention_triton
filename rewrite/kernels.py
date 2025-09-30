@@ -700,19 +700,33 @@ def rowwise_bwd(
         dtype=torch.float32
     ) 
 
-    # NOTE: need to run this twice, dont have a good way
+    res_ddest = torch.zeros(
+        (b, nheads, qlen), 
+        device=q.device, 
+        dtype=torch.float32
+    ) 
+
+    # NOTE: need to run this thrice, dont have a good way
     # to get both res_dZscore and res_dY_chunked in a single run
-    for p in [1,2]:
+    for p in [1,2,3]:
+
+        if p == 3:
+            # for the third pass, we need to accumulate
+            # this (so it becomes dZ1_chunked)
+            res_dY_chunked = res_dY_chunked.flip(-2).cumsum(dim=-2).flip(-2)
+
         _rowwise_bwd[grid](
             res_dQ, 
             res_dZscore,
             res_dY_chunked,
+            res_ddest,
             dout, q, k, v, src, dest,
             chunked_decay,
             score_denom,
             res_dQ.stride(0), res_dQ.stride(1), res_dQ.stride(2), res_dQ.stride(3),
             res_dZscore.stride(0), res_dZscore.stride(1), res_dZscore.stride(2), 
             res_dY_chunked.stride(0), res_dY_chunked.stride(1), res_dY_chunked.stride(2), res_dY_chunked.stride(3),
+            res_ddest.stride(0), res_ddest.stride(1), res_ddest.stride(2),
             dout.stride(0), dout.stride(1), dout.stride(2), dout.stride(3),
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
@@ -728,7 +742,7 @@ def rowwise_bwd(
             PASS=p,
         )
 
-    return res_dQ, res_dZscore, res_dY_chunked
+    return res_dQ, res_dZscore, res_dY_chunked, res_ddest
 
 @triton.autotune(
     [
@@ -741,6 +755,7 @@ def _rowwise_bwd(
     res_dQ, 
     res_dZsc,
     res_dYc,
+    res_ddest,
     dout, 
     queries, keys, values, 
     src, dest,
@@ -750,6 +765,7 @@ def _rowwise_bwd(
     res_dQ_stride_dim,
     res_dZsc_stride_b, res_dZsc_stride_h, res_dZsc_stride_seq, 
     res_dYc_stride_b, res_dYc_stride_h, res_dYc_stride_chunk, res_dYc_stride_seq, 
+    res_dd_stride_b, res_dd_stride_h, res_dd_stride_seq, 
     do_stride_b, do_stride_h, do_stride_seq, do_stride_dim,
     q_stride_b, q_stride_h, q_stride_seq, q_stride_dim,
     k_stride_b, k_stride_h, k_stride_seq, k_stride_dim,
@@ -776,6 +792,7 @@ def _rowwise_bwd(
     res_dQ += pid_b * res_dQ_stride_b + pid_h * res_dQ_stride_h
     res_dZsc += pid_b * res_dZsc_stride_b + pid_h * res_dZsc_stride_h
     res_dYc += pid_b * res_dYc_stride_b + pid_h * res_dYc_stride_h
+    res_ddest += pid_b * res_dd_stride_b + pid_h * res_dd_stride_h
     dout += pid_b * do_stride_b + pid_h * do_stride_h
     queries += pid_b * q_stride_b + pid_h * q_stride_h
     keys += pid_b * k_stride_b + hkv * k_stride_h
@@ -794,6 +811,7 @@ def _rowwise_bwd(
     res_dQ_r = res_dQ + pid_r * chunk_size * res_dQ_stride_qseq
     res_dZsc_r = res_dZsc + pid_r * chunk_size * res_dZsc_stride_seq
     res_dYc_r = res_dYc + pid_r * res_dYc_stride_chunk
+    res_dd_r = res_ddest + pid_r * chunk_size * res_dd_stride_seq
     dest += pid_r * chunk_size * dest_stride_seq
 
     # decay offset by chunk index
@@ -830,6 +848,7 @@ def _rowwise_bwd(
         # equals to query and key dim
         acc = tl.zeros([chunk_size, HEAD_DIM], dtype=tl.float32)
         acc2 = tl.zeros([chunk_size, HEAD_DIM], dtype=tl.float32)
+        acc3 = None
 
     elif PASS == 2:
         # in the 2nd pass we load dZScore
@@ -843,6 +862,24 @@ def _rowwise_bwd(
         # not needed
         acc = None
         acc2 = None
+        acc3 = None
+
+    elif PASS == 3:
+
+        # in the 3rd pass, we load dZScore
+        # to compute dY
+        dZScore_sum = tl.load(
+            res_dZsc_r + offs_i * res_dZsc_stride_seq,
+            mask=offs_i < limit_r,
+            other=0.0,
+        ).to(tl.float32)
+
+        # not needed
+        acc = None
+        acc2 = None
+
+        # for ddest
+        acc3 = tl.zeros([chunk_size], dtype=tl.float32)
 
     # load the dest
     dest_vec = tl.load(
@@ -1100,6 +1137,70 @@ def _rowwise_bwd(
                 ),
                 mask=offs_j < limit_c
             )
+        elif PASS == 3:
+            # in the 3rd pass we load dY_chunked
+            # which we assume it has been accumulated
+            # dZ1_chunked = dY_chunked.flip(-2).cumsum(dim=-2).flip(-2)
+
+            dZ1_boundary = tl.load(
+                res_dYc_r + offs_j,
+                mask=(
+                    offs_j < limit_c
+                ),
+                other=0.0,
+            ).to(tl.float32)
+
+            # dY (new)
+            dY = dZScore - tl.exp(score) * dZScore_sum[:, None]
+
+            # dZ1
+            # - NOTE: i need to rotate dY.. dont have a good 
+            # way to do it
+            dYrotate = tl.dot(
+                tl.where(
+                    (offs_i[:, None] - offs_j[None, :]) == 1,
+                    1.0, 0.0
+                ),
+                dY
+            )
+            dZ1 = tl.where(
+                (offs_i[:, None] > (offs_j[None, :] + offset)), 
+                dZ1_boundary[None, :] - tl.cumsum(dYrotate, axis=-2),
+                0.0
+            )
+
+            # Z2 = deltanet_relu2 * ds 
+            # term = Z2.pow(2/3) - Z2
+            #      = x^2 - x^3
+            #      = x^2 (1 - x)
+            # where x = affinity, and 0 <= x <= 1
+
+            # so then ddest is 
+            #   dZ2 * src * deletanet_relu2
+            #       = x^3 / dest
+            # where 
+            #   dZ2 = -dZ1 / (3 * term)
+            # so:
+            #   ddest = - dZ1 * x^3 / (3 * dest * term)
+            #         = - dZ1 * x^3 / (3 * x^2 (1-x) * dest)
+            #         = - dZ1 * x / (3 * (1-x) * dest)
+
+            A = -dZ1 / 3 * tl.exp(
+                tl.log(tl.clamp(affinity, 1e-4, 1.0))
+
+                # this is not decay
+                - tl.log(1.0 - tl.clamp(affinity, 0.0, 1.0 - 1e-6)) 
+
+                # recall it had pow(1/3) applied
+                - 3 * tl.log(tl.clamp(dest_vec[:, None], 1e-4, 1.0)) 
+            ) 
+
+            # ddest needs to be reduced over cols
+            acc3 += tl.sum(A, axis=-1)
+
+            # if pid_r == 0 and pid_h == 0 and c == 0:
+            #     # print ("dZ1", dZ1)
+            #     print ("acc3", acc3)
 
         # move pointer with column chunk
         keys += BLOCK_C * k_stride_seq
@@ -1130,6 +1231,12 @@ def _rowwise_bwd(
         tl.store(
             res_dZsc_r + offs_i * res_dZsc_stride_seq,
             dZScore_sum,
+            mask=offs_i < limit_r
+        )
+    elif PASS == 3:
+        tl.store(
+            res_dd_r + offs_i * res_dd_stride_seq,
+            acc3,
             mask=offs_i < limit_r
         )
 
@@ -1307,9 +1414,9 @@ def _colwise_bwd(
     chunked_dZ1 += pid_c * dz1_stride_chunk 
     chunked_dZ1 += pid_c * chunk_size * dz1_stride_seq
     dZ1_boundary = tl.load(
-        (chunked_dZ1 + offs_j[None,:]),
+        (chunked_dZ1 + offs_j),
         mask=(
-            offs_j[None, :] < limit_c
+            offs_j < limit_c
         ),
         other=0.0,
     ).to(tl.float32)
@@ -1538,14 +1645,9 @@ def _colwise_bwd(
         )
         dZ1 = tl.where(
             (offs_i[:, None] > (offs_j[None, :] + offset)), 
-            dZ1_boundary - tl.cumsum(dYrotate, axis=-2),
+            dZ1_boundary[None, :] - tl.cumsum(dYrotate, axis=-2),
             0.0
         )
-
-        # term = deltanet_relu2 * ds # Z2
-        # term = term.pow(2/3) - term
-        #      = x^2 - x^3
-        # where x = affinity, and 0 <= x <= 1
 
         # Z2 = deltanet_relu2 * ds 
         # term = Z2.pow(2/3) - Z2
@@ -1565,10 +1667,15 @@ def _colwise_bwd(
 
         A = -dZ1 / 3 * tl.exp(
             tl.log(tl.clamp(affinity, 1e-4, 1.0))
-            - tl.log(1.0 - tl.clamp(affinity, 0.0, 1.0 - 1e-6))
-            - 3 * tl.log(tl.clamp(src_vec[None, :], 1e-4, 1.0))
+
+            # this is not decay
+            - tl.log(1.0 - tl.clamp(affinity, 0.0, 1.0 - 1e-6)) 
+
+            # recall it had pow(1/3) applied
+            - 3 * tl.log(tl.clamp(src_vec[None, :], 1e-4, 1.0)) 
         ) 
 
+        # dsrc needs to be reduced over rows
         acc2 += tl.sum(A, axis=-2)
         # move pointer with row chunk
         queries_r += BLOCK_R * q_stride_seq
@@ -1592,9 +1699,9 @@ def _colwise_bwd(
 
             # if at the chunk boundary
             dZ1_boundary = tl.load(
-                (chunked_dZ1 + offs_j[None,:]),
+                chunked_dZ1 + offs_j,
                 mask=(
-                    offs_j[None, :] < limit_c
+                    offs_j < limit_c
                 ),
                 other=0.0,
             ).to(tl.float32)

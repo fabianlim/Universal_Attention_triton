@@ -1330,8 +1330,9 @@ def colwise_bwd(
     # TODO: check sizes
     b, nheads, qlen, qdim = q.shape
     _, kvheads, klen, _ = k.shape
-    _, _, _, vdim = v.shape
+    _, _, vlen, vdim = v.shape
     assert qlen == klen
+    assert qlen == vlen
     assert nheads % kvheads == 0
     assert qdim == vdim
 
@@ -1355,6 +1356,12 @@ def colwise_bwd(
         dtype=torch.float32
     ) 
 
+    res_dV = torch.zeros(
+        (b, nheads, vlen, vdim), 
+        device=q.device, 
+        dtype=torch.float32
+    ) 
+
     res_dsrc = torch.zeros(
         (b, nheads, qlen), 
         device=q.device, 
@@ -1363,12 +1370,14 @@ def colwise_bwd(
 
     _colwise_bwd[grid](
         res_dK2,
+        res_dV,
         res_dsrc,
         dout, q, k, v, src, dest,
         chunked_dZ1,
         score_denom,
         dZScoreSum,
         res_dK2.stride(0), res_dK2.stride(1), res_dK2.stride(2), res_dK2.stride(3),
+        res_dV.stride(0), res_dV.stride(1), res_dV.stride(2), res_dV.stride(3),
         res_dsrc.stride(0), res_dsrc.stride(1), res_dsrc.stride(2),
         dout.stride(0), dout.stride(1), dout.stride(2), dout.stride(3),
         q.stride(0), q.stride(1), q.stride(2), q.stride(3),
@@ -1385,7 +1394,7 @@ def colwise_bwd(
         chunk_size=chunk_size,
     )
 
-    return res_dK2, res_dsrc
+    return res_dK2, res_dV, res_dsrc
 
 @triton.autotune(
     [
@@ -1396,6 +1405,7 @@ def colwise_bwd(
 @triton.jit
 def _colwise_bwd(
     res_dK2, 
+    res_dV,
     res_dsrc,
     dout, 
     queries, keys, values, 
@@ -1403,8 +1413,10 @@ def _colwise_bwd(
     chunked_dZ1,
     score_denom,
     dZScoreSum, 
-    res_dK2_stride_b, res_dK2_stride_h, res_dK2_stride_qseq, 
+    res_dK2_stride_b, res_dK2_stride_h, res_dK2_stride_seq, 
     res_dK2_stride_dim,
+    res_dV_stride_b, res_dV_stride_h, res_dV_stride_seq, 
+    res_dV_stride_dim,
     res_dsrc_stride_b, res_dsrc_stride_h, res_dsrc_stride_seq, 
     do_stride_b, do_stride_h, do_stride_seq, do_stride_dim,
     q_stride_b, q_stride_h, q_stride_seq, q_stride_dim,
@@ -1422,12 +1434,14 @@ def _colwise_bwd(
     BLOCK_D: tl.constexpr,
     HEAD_DIM: tl.constexpr,
 ):
+
     pid_b = tl.program_id(0) # batch
     pid_h = tl.program_id(1) # query head
     hkv = pid_h // group_size # key / value head
     pid_c = tl.program_id(2) # col chunk
 
     # offset by batch and head
+    res_dV += pid_b * res_dV_stride_b + pid_h * res_dV_stride_h
     res_dK2 += pid_b * res_dK2_stride_b + pid_h * res_dK2_stride_h
     res_dsrc += pid_b * res_dsrc_stride_b + pid_h * res_dsrc_stride_h
     dout += pid_b * do_stride_b + pid_h * do_stride_h
@@ -1452,7 +1466,8 @@ def _colwise_bwd(
     dout_r = dout + pid_c * chunk_size * do_stride_seq
     denom_r = score_denom + pid_c * chunk_size * denom_stride_seq
     dZS_r = dZScoreSum + pid_c * chunk_size * dZS_stride_seq
-    res_dK2_c = res_dK2 + pid_c * chunk_size * res_dK2_stride_qseq
+    res_dK2_c = res_dK2 + pid_c * chunk_size * res_dK2_stride_seq
+    res_dV_c = res_dV + pid_c * chunk_size * res_dV_stride_seq
     res_src_c = res_dsrc + pid_c * chunk_size * res_dsrc_stride_seq
 
     # - since we start on the block diag
@@ -1498,8 +1513,11 @@ def _colwise_bwd(
     # computation of dK_2
     acc = tl.zeros([chunk_size, HEAD_DIM], dtype=tl.float32)
 
+    # computation of dV
+    acc2 = tl.zeros([chunk_size, HEAD_DIM], dtype=tl.float32)
+
     # computation of dsrc
-    acc2 = tl.zeros([chunk_size], dtype=tl.float32)
+    acc3 = tl.zeros([chunk_size], dtype=tl.float32)
 
     # load the src
     src_vec = tl.load(
@@ -1707,6 +1725,20 @@ def _colwise_bwd(
         #   zeros in appropriate places
         acc += tl.dot(qt_mat, dY)
 
+        dot_mat = tl.load(
+            (
+                dout_r 
+                + offs_v[:, None] * do_stride_dim # NOTE: assumed same
+                + offs_j[None, :] * do_stride_seq
+            ),
+            mask=(offs_j[None, :] < limit_c),
+            other=0.0
+        ).to(tl.float32)
+
+        # dV
+        # - score should have zeros in appropriate places
+        acc2 += tl.dot(dot_mat, tl.exp(score))
+
         # dZ1
         # - NOTE: i need to rotate dY.. dont have a good 
         # way to do it
@@ -1790,7 +1822,7 @@ def _colwise_bwd(
         (
             res_dK2_c 
             + offs_v[:, None] * res_dK2_stride_dim
-            + offs_j[None, :] * res_dK2_stride_qseq
+            + offs_j[None, :] * res_dK2_stride_seq
         ),
         acc,
         mask=(
@@ -1800,9 +1832,21 @@ def _colwise_bwd(
 
     tl.store(
         (
-            res_src_c + offs_j * res_dsrc_stride_seq
+            res_dV_c 
+            + offs_v[:, None] * res_dV_stride_dim
+            + offs_j[None, :] * res_dV_stride_seq
         ),
         acc2,
+        mask=(
+            (offs_j[None, :] < limit_c)
+        )
+    )
+
+    tl.store(
+        (
+            res_src_c + offs_j * res_dsrc_stride_seq
+        ),
+        acc3,
         mask=(
             (offs_j < limit_c)
         )

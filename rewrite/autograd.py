@@ -1,6 +1,8 @@
 from torch.autograd import Function
 from .kernels import (
-    chunked_decay, softmax_with_decay_fwd, CHUNK_SIZE
+    chunked_decay, softmax_with_decay_fwd, 
+    rowwise_bwd, colwise_bwd,
+    CHUNK_SIZE
 )
 import torch
 
@@ -433,8 +435,8 @@ class UniversalAttention(Function):
     def forward(
         ctx, k, v, q, src, dest,
     ):
-        ## NOTE: assume k is normalized and
-        # src and dest are sigmoided
+        ## NOTE: assume k is not yet normalized and
+        # src and dest are not yet sigmoided
 
         # Pass1: get the chunked kernel
         decay_chunks = chunked_decay(
@@ -469,15 +471,29 @@ class UniversalAttention(Function):
             score_denom,
         ) = ctx.saved_tensors
 
-        dK, dV, dQ, dsrc, ddest = _backward_slow_draft(
-            dout, 
-            k, v, q, 
-            src.sigmoid(), dest.sigmoid(),
-            decay_chunks,
+        # dK, dV, dQ, dsrc, ddest = _backward_slow_draft(
+        #     dout, 
+        #     k, v, q, 
+        #     src.sigmoid(), dest.sigmoid(),
+        #     decay_chunks,
+        #     score_denom,
+        # )
+
+        dQ, dK1, dZsum, dZ1_chunked, ddest = rowwise_bwd(
+            dout, q, k, v, src, dest,
+            decay_chunks, 
             score_denom,
         )
-        
-        # NOTE: since we accepted src and dest befor ethe sigmoid
+
+        dK2, dV, dsrc = colwise_bwd(
+            dout, q, k, v, 
+            src, dest,
+            score_denom,
+            dZsum,
+            dZ1_chunked,
+        )
+
+        # NOTE: since we accepted src and dest before the sigmoid
         # we need to accomodate for the transformation, since the above
         # derivation assumed src and dest were sigmoided
         dsrc *= (
@@ -488,7 +504,7 @@ class UniversalAttention(Function):
         )
 
         return (
-            dK, # k
+            dK1 + dK2, # k
             dV, 
             dQ, 
             dsrc, 

@@ -427,20 +427,19 @@ def _backward_slow_parallelizable(
         sum(outputs_ddest),
     )
 
-# this is a a draft of the 
-
 class UniversalAttention(Function):
 
     @staticmethod
     def forward(
         ctx, k, v, q, src, dest,
     ):
-        ## NOTE: assume k is not yet normalized and
-        # src and dest are not yet sigmoided
+        # Assume k is normalized and 
+        # src and dest already sigmoided
 
         # Pass1: get the chunked kernel
         decay_chunks = chunked_decay(
             k, src, dest, 
+            skip_preprocessing=True,
         )
 
         # - we then need to pass the chunks forward
@@ -453,6 +452,7 @@ class UniversalAttention(Function):
             src, dest, 
             decay_chunks,
             return_denom=True,
+            skip_preprocessing=True,
         )
 
         ctx.save_for_backward(
@@ -468,9 +468,10 @@ class UniversalAttention(Function):
 
         (
             k, v, q, src, dest, decay_chunks,
-            score_denom,
+            score_denom, 
         ) = ctx.saved_tensors
 
+        # NOTE: the below is equivalen to the following drafts
         # dK, dV, dQ, dsrc, ddest = _backward_slow_draft(
         #     dout, 
         #     k, v, q, 
@@ -479,34 +480,37 @@ class UniversalAttention(Function):
         #     score_denom,
         # )
 
-        dQ, dK1, dZsum, dZ1_chunked, ddest = rowwise_bwd(
+        dQ, dK1, dZScoreSum, dZ1_chunked, ddest = rowwise_bwd(
             dout, q, k, v, src, dest,
             decay_chunks, 
             score_denom,
+            skip_preprocessing=True,
         )
 
         dK2, dV, dsrc = colwise_bwd(
             dout, q, k, v, 
             src, dest,
             score_denom,
-            dZsum,
+            dZScoreSum,
             dZ1_chunked,
+            skip_preprocessing=True,
         )
 
-        # NOTE: since we accepted src and dest before the sigmoid
+        # NOTE: this is needed only if we allow
+        # src and dest before the sigmoid
         # we need to accomodate for the transformation, since the above
         # derivation assumed src and dest were sigmoided
-        dsrc *= (
-            src.sigmoid() * (1 - src.sigmoid())
-        )
-        ddest *= (
-            dest.sigmoid() * (1 - dest.sigmoid())
-        )
+        # dsrc *= (
+        #     src.sigmoid() * (1 - src.sigmoid())
+        # )
+        # ddest *= (
+        #     dest.sigmoid() * (1 - dest.sigmoid())
+        # )
 
         return (
             dK1 + dK2, # k
             dV, 
             dQ, 
             dsrc, 
-            ddest
+            ddest,
         )

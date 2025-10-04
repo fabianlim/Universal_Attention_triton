@@ -688,7 +688,7 @@ def rowwise_bwd(
     ) 
 
     res_dK1 = torch.zeros(
-        (b, nheads, klen, qdim), 
+        (b, kvheads, klen, qdim), 
         device=q.device, 
         dtype=torch.float32
     ) 
@@ -707,7 +707,7 @@ def rowwise_bwd(
     ) 
 
     res_ddest = torch.zeros(
-        (b, nheads, qlen), 
+        (b, kvheads, qlen), 
         device=q.device, 
         dtype=torch.float32
     ) 
@@ -801,10 +801,10 @@ def _rowwise_bwd(
 
     # offset by batch and head
     res_dQ += pid_b * res_dQ_stride_b + pid_h * res_dQ_stride_h
-    res_dK1 += pid_b * res_dK1_stride_b + pid_h * res_dK1_stride_h
+    res_dK1 += pid_b * res_dK1_stride_b + hkv * res_dK1_stride_h
     res_dZsc += pid_b * res_dZsc_stride_b + pid_h * res_dZsc_stride_h
     res_dYc += pid_b * res_dYc_stride_b + pid_h * res_dYc_stride_h
-    res_ddest += pid_b * res_dd_stride_b + pid_h * res_dd_stride_h
+    res_ddest += pid_b * res_dd_stride_b + hkv * res_dd_stride_h
     dout += pid_b * do_stride_b + pid_h * do_stride_h
     queries += pid_b * q_stride_b + pid_h * q_stride_h
     keys += pid_b * k_stride_b + hkv * k_stride_h
@@ -1351,19 +1351,19 @@ def colwise_bwd(
         # - static_src and static_dest assumed to be sigmoided
 
     res_dK2 = torch.zeros(
-        (b, nheads, qlen, qdim), 
+        (b, kvheads, qlen, qdim), 
         device=q.device, 
         dtype=torch.float32
     ) 
 
     res_dV = torch.zeros(
-        (b, nheads, vlen, vdim), 
+        (b, kvheads, vlen, vdim), 
         device=q.device, 
         dtype=torch.float32
     ) 
 
     res_dsrc = torch.zeros(
-        (b, nheads, qlen), 
+        (b, kvheads, qlen), 
         device=q.device, 
         dtype=torch.float32
     ) 
@@ -1441,9 +1441,9 @@ def _colwise_bwd(
     pid_c = tl.program_id(2) # col chunk
 
     # offset by batch and head
-    res_dV += pid_b * res_dV_stride_b + pid_h * res_dV_stride_h
-    res_dK2 += pid_b * res_dK2_stride_b + pid_h * res_dK2_stride_h
-    res_dsrc += pid_b * res_dsrc_stride_b + pid_h * res_dsrc_stride_h
+    res_dV += pid_b * res_dV_stride_b + hkv * res_dV_stride_h
+    res_dK2 += pid_b * res_dK2_stride_b + hkv * res_dK2_stride_h
+    res_dsrc += pid_b * res_dsrc_stride_b + hkv * res_dsrc_stride_h
     dout += pid_b * do_stride_b + pid_h * do_stride_h
     queries += pid_b * q_stride_b + pid_h * q_stride_h
     dZScoreSum += pid_b * dZS_stride_b + pid_h * dZS_stride_h
@@ -1511,10 +1511,10 @@ def _colwise_bwd(
     ).to(tl.float32)
 
     # computation of dK_2
-    acc = tl.zeros([chunk_size, HEAD_DIM], dtype=tl.float32)
+    acc = tl.zeros([HEAD_DIM, chunk_size], dtype=tl.float32)
 
     # computation of dV
-    acc2 = tl.zeros([chunk_size, HEAD_DIM], dtype=tl.float32)
+    acc2 = tl.zeros([HEAD_DIM, chunk_size], dtype=tl.float32)
 
     # computation of dsrc
     acc3 = tl.zeros([chunk_size], dtype=tl.float32)
@@ -1782,7 +1782,7 @@ def _colwise_bwd(
         ) 
 
         # dsrc needs to be reduced over rows
-        acc2 += tl.sum(A, axis=-2)
+        acc3 += tl.sum(A, axis=-2)
         # move pointer with row chunk
         queries_r += BLOCK_R * q_stride_seq
         keys_r += BLOCK_R * k_stride_seq

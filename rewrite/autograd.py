@@ -1,5 +1,5 @@
 from torch.autograd import Function
-from .kernels import (
+from rewrite.kernels import (
     chunked_decay, softmax_with_decay_fwd, 
     rowwise_bwd, colwise_bwd,
     CHUNK_SIZE

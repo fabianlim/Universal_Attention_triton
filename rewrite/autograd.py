@@ -2,7 +2,6 @@ from torch.autograd import Function
 from rewrite.kernels import (
     chunked_decay, softmax_with_decay_fwd, 
     rowwise_bwd, colwise_bwd,
-    CHUNK_SIZE
 )
 import torch
 
@@ -171,7 +170,7 @@ def _backward_slow_draft(
 def _backward_slow_parallelizable(
     dout, k, v, q, src, dest, chunked_decay,
     score_denom,
-    chunk_size=CHUNK_SIZE,
+    chunk_size=32,
 ):
     # L2-normalize K
     k = k/k.pow(2).sum(-1,True).sqrt().add(1e-6)

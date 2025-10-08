@@ -5,15 +5,8 @@ from utils_methods import (
     set_seed, random_instance, 
 )
 
-# from methods_test import blockwise_ua_test_harness
-# from Universal_Attention.triton.universal_attention_kernel import _universal_attention_fwd, _universal_attention_bwd
 from Universal_Attention.universal_attention import UniversalAttention as UA_ref1
-# from universal_attention_autograd import UniversalAttention as UA_ref1
 from Universal_Attention.triton.universal_attention_kernel_opt import _attention
-# from kernels import (
-#     chunked_decay,
-#     # softmax_with_decay_fwd
-# )
 from autograd import UniversalAttention as UA
 
 from unittest.mock import patch
@@ -23,14 +16,14 @@ from functools import partial
 import json
 import time
 from typing import Union, Callable, Tuple
-from copy import deepcopy
 
 # inspired by https://github.com/IST-DASLab/marlin/blob/master/bench.py
 def benchmark(
     f, 
     args: Union[Tuple, Callable],
     warmup=1, iter=10, 
-    run_backward: bool = False
+    run_backward: bool = False,
+    account_for_args: bool = False,
 ):
 
     torch.cuda.empty_cache()
@@ -47,7 +40,8 @@ def benchmark(
             # - this will eat into some of the estimated time
             args_tick = time.time()
             _args = args()
-            if i >= warmup:
+            if account_for_args and i >= warmup:
+                print ('args time')
                 args_time += (time.time() - args_tick)
         else:
             _args = args
@@ -131,7 +125,6 @@ def run_legacy_impl_one(
         nheads // kvheads, 
         num_chunks*2, chunk_size//2, -1
     )
-    # out, denom = _universal_attention_fwd(kc, vc, queries, static_src, static_dest)
     output, denom = UA_ref1.apply(
         kc, vc, queries, static_src, static_dest
     )
@@ -163,21 +156,6 @@ def run_two_pass(
     static_src, static_dest,
     chunk_size,
 ):
-    # Pass1: get the chunked kernel
-    # decay_chunks = chunked_decay(keys, static_src, static_dest)
-
-    # # - still no kernel for this
-    # decay_chunks = decay_chunks.cumsum(-2)
-
-    # out = softmax_with_decay_fwd(
-    #     queries, 
-    #     keys, 
-    #     values, 
-    #     static_src, static_dest,
-    #     decay_chunks,
-    #     return_decay=False,
-    #     chunk_size=chunk_size,
-    # )
     with patch('rewrite.kernels.CHUNK_SIZE', chunk_size):
         out = UA.apply(
             keys / keys.pow(2).sum(-1, True).sqrt().add(1e-6),
@@ -202,9 +180,10 @@ if __name__ == '__main__':
         16, 32, 128
     ]
     CHUNK_SIZE = [
-        32, 64, 128
+        128 # 32, 64, 128
     ]
     RUN_BACKWARD = [
+        # False, 
         True
     ]
 
@@ -214,31 +193,8 @@ if __name__ == '__main__':
         CHUNK_SIZE,
         RUN_BACKWARD
     ):
-        # for now we just test the forwards
-        # q, k, v, static_src, static_dest = prepare_problem(
-        # args = prepare_problem(
-        #     b, l, h, d, device='cuda', 
-        #     requires_grad=run_backward
-        # )
-        # q2, k2, v2, static_src2, static_dest2 = prepare_problem(
-        #     b, l, h, d, device='cuda', 
-        #     requires_grad=run_backward
-        # )
-        # q3, k3, v3, static_src3, static_dest3 = prepare_problem(
-        #     b, l, h, d, device='cuda', 
-        #     requires_grad=run_backward
-        # )
 
         if run_backward:
-            # for the static's we need to 
-            # set the grad like this because there are some
-            # operations applied when creating these tensors
-            # static_src = static_src.requires_grad_()
-            # static_dest = static_dest.requires_grad_()
-            # static_src2 = static_src2.requires_grad_()
-            # static_dest2 = static_dest2.requires_grad_()
-            # static_src3 = static_src3.requires_grad_()
-            # static_dest3 = static_dest3.requires_grad_()
             ctx = nullcontext
 
             # we have to pass the function in to create the 

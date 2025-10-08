@@ -856,11 +856,9 @@ def _rowwise_bwd(
         # in the first pass we compute dZScore
         dZScore_sum = tl.zeros([chunk_size], dtype=tl.float32)
 
-        # computation of dQ
         # TODO: its not gauranteed that value dim 
         # equals to query and key dim
-        acc = tl.zeros([chunk_size, HEAD_DIM], dtype=tl.float32)
-        acc2 = tl.zeros([chunk_size, HEAD_DIM], dtype=tl.float32)
+        acc = None
         acc3 = None
         acc4 = None
 
@@ -873,9 +871,10 @@ def _rowwise_bwd(
             other=0.0,
         ).to(tl.float32)
 
+        # for dQ
+        acc = tl.zeros([chunk_size, HEAD_DIM], dtype=tl.float32)
+
         # not needed
-        acc = None
-        acc2 = None
         acc3 = None
         acc4 = None
 
@@ -891,7 +890,6 @@ def _rowwise_bwd(
 
         # not needed
         acc = None
-        acc2 = None
 
         # for ddest
         acc3 = tl.zeros([chunk_size], dtype=tl.float32)
@@ -1097,16 +1095,12 @@ def _rowwise_bwd(
 
         if PASS == 1:
             # - in pass 1, we compute 
-            # dZScore and dQ (see acc, acc2)
-            # in an online approach
-
-            # we need to compute 
-            # _dzScore = (dZ * score).sum(-1, keepdim=True) # see notes above
-            # dY = score * (dZ - _dzScore)
-            #    = dZScore - score * _dzScore
-            # we accum score * dZ and score * _dzScore seperately
-            dZScore_prev_sum = dZScore_sum
+            # dZScoreSum
             dZScore_sum += tl.sum(dZScore, axis=1)
+        elif PASS == 2:
+            
+            # in pass 2 need to compute 
+            # _dzScore = (dZ * score).sum(-1, keepdim=True) # see notes above
 
             k_mat = tl.load(
                 (
@@ -1121,21 +1115,9 @@ def _rowwise_bwd(
             # first term (score * dZ)
             # - dZ should have the appropriate zeros in the boundary
             acc += tl.dot(
-                dZScore, k_mat
-            )
-
-            # secod term score * (dZ * score).sum(-1)
-            if c > 0:
-                ratio = (
-                    dZScore_sum / dZScore_prev_sum
-                )
-                acc2 *= ratio[:, None]
-
-            acc2 += tl.dot(
-                tl.exp(score) * dZScore_sum[:, None], 
+                dZScore - tl.exp(score) * dZScore_sum[:, None], 
                 k_mat
             )
-        elif PASS == 2:
 
             # in pass 2, we compute the chunked
             # dY, 
@@ -1273,25 +1255,27 @@ def _rowwise_bwd(
     # -  DONE WITH COL CHUNK LOOPS - 
 
     if PASS == 1:
-        # in PASS 1 we compute dQ 
+        # we compute dZScore_sum
+        tl.store(
+            res_dZsc_r + offs_i * res_dZsc_stride_seq,
+            dZScore_sum,
+            mask=offs_i < limit_r
+        )
+    elif PASS == 2:
+        # in PASS 2 we compute dQ 
         tl.store(
             (
                 res_dQ_r 
                 + offs_i[:, None] * res_dQ_stride_qseq
                 + offs_v[None, :] * res_dQ_stride_dim
             ),
-            acc - acc2, 
+            acc,
             mask=(
                 (offs_i[:, None] < limit_r)
             )
         )
 
-        # we also output dZScore_sum
-        tl.store(
-            res_dZsc_r + offs_i * res_dZsc_stride_seq,
-            dZScore_sum,
-            mask=offs_i < limit_r
-        )
+
     elif PASS == 3:
         # in pass 3 we compute
         # ddest

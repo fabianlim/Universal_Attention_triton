@@ -1176,7 +1176,7 @@ def _rowwise_bwd(
             # way to do it
             dYrotate = tl.dot(
                 tl.where(
-                    (offs_i[:, None] - offs_j[None, :]) == 1,
+                    (offs_i[:, None] - offs_i[None, :]) == 1,
                     1.0, 0.0
                 ),
                 dY
@@ -1711,9 +1711,9 @@ def _colwise_bwd(
             (
                 qc_mat_ptr 
                 + offs_v[:, None] * q_stride_dim # NOTE: assumed same
-                + offs_j[None, :] * q_stride_seq
+                + offs_i[None, :] * q_stride_seq
             ),
-            mask=(offs_j[None, :] < limit_c),
+            mask=(offs_i[None, :] < limit_r),
             other=0.0
         ).to(tl.float32)
 
@@ -1729,9 +1729,9 @@ def _colwise_bwd(
             (
                 dout_r 
                 + offs_v[:, None] * do_stride_dim # NOTE: assumed same
-                + offs_j[None, :] * do_stride_seq
+                + offs_i[None, :] * do_stride_seq
             ),
-            mask=(offs_j[None, :] < limit_c),
+            mask=(offs_i[None, :] < limit_r),
             other=0.0
         ).to(tl.float32)
 
@@ -1744,7 +1744,7 @@ def _colwise_bwd(
         # way to do it
         dYrotate = tl.dot(
             tl.where(
-                (offs_i[:, None] - offs_j[None, :]) == 1,
+                (offs_i[:, None] - offs_i[None, :]) == 1,
                 1.0, 0.0
             ),
             dY

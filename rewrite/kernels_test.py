@@ -218,6 +218,8 @@ def test_two_pass_autograd_with_simp_impl(
     )
     out_ref.norm().backward()
 
+    # NOTE: this is broken, the chunk size is not 
+    # really changing
     with patch('rewrite.kernels.CHUNK_SIZE', chunk_size):
         # the autograd function assumes k, src, dest
         # already normalized

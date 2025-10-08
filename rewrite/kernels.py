@@ -176,14 +176,14 @@ def _chunked_decay(
         # - this is equivalent to 
         #   i > j + offset 
         #   where offset = c * BLOCK_C - pid_r * chunk_size
-        # - this is trivally satisfied if offset < 0
+        # - so in the case j=0, check i > offset
         # - so we check chunk_size - 1 > offset
         # - same as chunk_size >= offset
 
         # if the rightmost element of the block
         # is greater
         offset = c * BLOCK_C - pid_r * chunk_size
-        if offset >= 0 and chunk_size >= offset:
+        if chunk_size >= offset:
             decay = tl.where(
                 (offs_i[:, None] > (offs_j[None, :] + offset)), 
                 decay, 0.0
@@ -478,7 +478,7 @@ def _softmax_with_decay_fwd(
         # if the rightmost element of the block
         # is greater
         offset = c * BLOCK_C - pid_r * chunk_size
-        if offset >= 0 and chunk_size >= offset:
+        if chunk_size >= offset:
             decay = tl.where(
                 (offs_i[:, None] > (offs_j[None, :] + offset)), 
                 decay, 
@@ -519,7 +519,7 @@ def _softmax_with_decay_fwd(
 
         # NOTE: see above notes
         offset = c * BLOCK_C - pid_r * chunk_size
-        if offset >= 0 and chunk_size >= offset:
+        if chunk_size >= offset:
             decay = tl.where(
                 (offs_i[:, None] >= (offs_j[None, :] + offset)), 
                 decay, 
@@ -1028,7 +1028,7 @@ def _rowwise_bwd(
         # if the rightmost element of the block
         # is greater
         offset = c * BLOCK_C - pid_r * chunk_size
-        if offset >= 0 and chunk_size >= offset:
+        if chunk_size >= offset:
             decay = tl.where(
                 (offs_i[:, None] > (offs_j[None, :] + offset)), 
                 decay, 
@@ -1058,7 +1058,7 @@ def _rowwise_bwd(
 
         # NOTE: see above notes
         offset = c * BLOCK_C - pid_r * chunk_size
-        if offset >= 0 and chunk_size >= offset:
+        if chunk_size >= offset:
             decay = tl.where(
                 (offs_i[:, None] >= (offs_j[None, :] + offset)), 
                 decay, 
@@ -1650,7 +1650,7 @@ def _colwise_bwd(
         # is greater
         # - since r is offset by pid_c, we need to add
         offset = pid_c * chunk_size - (pid_c + r) * BLOCK_R
-        if offset >= 0 and BLOCK_R >= offset:
+        if BLOCK_R >= offset:
             decay = tl.where(
                 (offs_i[:, None] > (offs_j[None, :] + offset)), 
                 decay, 
@@ -1664,7 +1664,7 @@ def _colwise_bwd(
         decay_prev_chunk += chunk_decay_sum
 
         # same offset as above
-        if offset >= 0 and BLOCK_R >= offset:
+        if BLOCK_R >= offset:
             decay = tl.where(
                 (offs_i[:, None] >= (offs_j[None, :] + offset)), 
                 decay, 

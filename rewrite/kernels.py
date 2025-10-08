@@ -2,15 +2,19 @@ import torch
 import triton
 import triton.language as tl
 
-CHUNK_SIZE = 16 # TODO: tune this
+CHUNK_SIZE = 128 # TODO: tune this
 
 def chunked_decay(
     keys: torch.Tensor, # b,h,l,d
     src: torch.Tensor,
     dest: torch.Tensor,
     skip_preprocessing: bool = False,
-    chunk_size: int = CHUNK_SIZE,
+    chunk_size: int = None,
 ):
+
+    if chunk_size is None:
+        chunk_size = CHUNK_SIZE
+
 
     b, kvheads, klen, kdim = keys.shape
     num_chunks = triton.cdiv(klen, chunk_size)
@@ -213,11 +217,15 @@ def softmax_with_decay_fwd(
     src: torch.Tensor,
     dest: torch.Tensor,
     chunked_decay: torch.Tensor,
-    chunk_size: int = CHUNK_SIZE,
+    chunk_size: int = None,
     return_denom: bool = False,
     return_decay: bool = False,
     skip_preprocessing: bool = False,
 ):
+
+    if chunk_size is None:
+        chunk_size = CHUNK_SIZE
+
     # TODO: check sizes
     b, nheads, qlen, qdim = q.shape
     _, kvheads, klen, _ = k.shape
@@ -656,9 +664,13 @@ def rowwise_bwd(
     dest: torch.Tensor,
     chunked_decay: torch.Tensor,
     score_denom: torch.Tensor,
-    chunk_size: int = CHUNK_SIZE,
+    chunk_size: int = None,
     skip_preprocessing: bool = False,
 ):
+
+    if chunk_size is None:
+        chunk_size = CHUNK_SIZE
+
     # TODO: check sizes
     b, nheads, qlen, qdim = q.shape
     _, kvheads, klen, _ = k.shape
@@ -1007,7 +1019,7 @@ def _rowwise_bwd(
 
         affinity0 = affinity # store
         # .relu().pow(2/3)
-        affinity1 = tl.exp2(tl.log2(tl.maximum(affinity, 0.0)) * 2.0 / 3.0)
+        affinity = tl.exp2(tl.log2(tl.maximum(affinity, 0.0)) * 2.0 / 3.0)
 
         # load the src
         src_vec = tl.load(
@@ -1016,7 +1028,7 @@ def _rowwise_bwd(
             other=0.0,
         ).to(tl.float32)
         src_vec = tl.exp2(tl.log2(src_vec) / 3.0) # pow (1/3)
-        affinity = affinity1 * dest_vec[:, None] * src_vec[None, :]
+        affinity = affinity * dest_vec[:, None] * src_vec[None, :]
 
         # - convert to log(1-p)
         # torch.log1p(affinity.clamp(min=0, max=1-1e-6).neg())
@@ -1208,29 +1220,41 @@ def _rowwise_bwd(
 
             # - recall above affinity0 is deltanet
             # - affinity1 is deltanet_relu2
-            # dZ2 * ds * deltanet
-            #  = - dZ1 * x^3 * (deltanet) / (3 * term * deltanet_relu2)
+            # dZ2 * ds 
+            #  = - dZ1 * x^3 / (3 * term * deltanet_relu2)
+            #
+            # where x^3 = ds * deltanet_relu2
+            # 
+            # Thus, 2 * dZ3 
+            #  = 2 * dZ2 * ds * deltanet
+            #  = - dZ1 * x^3 * deltanet / (3 * term * deltanet_relu2)
+            #
+            # where we compute 2 * dZ3 only for deltanet > 0
+            # so -> deltanet / deltanet_relu2
+            #    => delenet / deltanet^2 (when deltanet > 0)
+            #    => 1 / deltanet
+            # NOTE: this computation is not very stable so 
+            # the variance tends to be high
             B = -dZ1 * 2 / 3 * tl.exp(
                 tl.log(tl.clamp(affinity, 1e-4, 1.0))
 
                 # this is not decay
                 - tl.log(1.0 - tl.clamp(affinity, 0.0, 1.0 - 1e-6)) 
 
-                # recall it had pow(1/3) applied
-                - 3 * tl.log(tl.clamp(affinity1, 1e-4, 1.0)) 
+                # see the explaination above
+                - tl.log(
+                    tl.maximum(affinity0, 1e-3)
+                ) 
             ) 
 
             # this is 2 * dZ3
-            B *= tl.where(
-                affinity0 >= 0,
-                2 * affinity0, 0.
-            )
+            B = tl.where(affinity0 > 0, B, 0.)
 
             k_mat = tl.load(
                 (
                     keys 
-                    + offs_j[:, None] * v_stride_seq
-                    + offs_v[None, :] * v_stride_dim
+                    + offs_j[:, None] * k_stride_seq
+                    + offs_v[None, :] * k_stride_dim
                 ),
                 mask=(offs_j[:, None] < limit_c),
                 other=0.0
@@ -1308,9 +1332,13 @@ def colwise_bwd(
     score_denom: torch.Tensor,
     dZScoreSum: torch.Tensor,
     chunked_dZ1: torch.Tensor,
-    chunk_size: int = CHUNK_SIZE,
+    chunk_size: int = None,
     skip_preprocessing: bool = False,
 ):
+
+    if chunk_size is None:
+        chunk_size = CHUNK_SIZE
+
     # TODO: check sizes
     b, nheads, qlen, qdim = q.shape
     _, kvheads, klen, _ = k.shape
@@ -1633,13 +1661,13 @@ def _colwise_bwd(
         # if the rightmost element of the block
         # is greater
         # - since r is offset by pid_c, we need to add
-        offset = pid_c * chunk_size - (pid_c + r) * BLOCK_R
-        if BLOCK_R >= offset:
-            decay = tl.where(
-                (offs_i[:, None] > (offs_j[None, :] + offset)), 
-                decay, 
-                0.0 # dont set this to -inf yet because we need to cumsum
-            )
+        # offset = pid_c * chunk_size - r * BLOCK_R - pid_c * chunk_size
+        offset = - r * BLOCK_R 
+        decay = tl.where(
+            (offs_i[:, None] > (offs_j[None, :] + offset)), 
+            decay, 
+            0.0 # dont set this to -inf yet because we need to cumsum
+        )
 
         # cumsum over the chunk rows
         chunk_decay_sum = tl.sum(decay, axis=-2)
@@ -1648,12 +1676,11 @@ def _colwise_bwd(
         decay_prev_chunk += chunk_decay_sum
 
         # same offset as above
-        if BLOCK_R >= offset:
-            decay = tl.where(
-                (offs_i[:, None] >= (offs_j[None, :] + offset)), 
-                decay, 
-                - float("inf"), # not set it to inf
-            )
+        decay = tl.where(
+            (offs_i[:, None] >= (offs_j[None, :] + offset)), 
+            decay, 
+            - float("inf"), # not set it to inf
+        )
 
         # ---------- COMPUTE dZScore -------------
         score += decay

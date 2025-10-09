@@ -1,5 +1,5 @@
 from torch.autograd import Function
-from rewrite.kernels import (
+from Universal_Attention_triton.rewrite.kernels import (
     chunked_decay, softmax_with_decay_fwd, 
     rowwise_bwd, colwise_bwd,
 )
@@ -451,6 +451,7 @@ class UniversalAttention(Function):
             src, dest, 
             decay_chunks,
             return_denom=True,
+            return_decay=False,
             skip_preprocessing=True,
         )
 

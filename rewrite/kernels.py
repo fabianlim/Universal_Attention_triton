@@ -2,7 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
-CHUNK_SIZE = 128 # TODO: tune this
+CHUNK_SIZE = 16 # TODO: tune this
 
 def chunked_decay(
     keys: torch.Tensor, # b,h,l,d

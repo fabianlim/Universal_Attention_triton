@@ -1243,7 +1243,7 @@ def _rowwise_bwd(
 
                 # see the explaination above
                 - tl.log(
-                    tl.maximum(affinity0, 1e-3)
+                    tl.maximum(affinity0, 1e-4)
                 ) 
             ) 
 

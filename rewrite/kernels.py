@@ -56,7 +56,8 @@ def chunked_decay(
 
 @triton.autotune(
     [
-        triton.Config({'BLOCK_C': 16, 'BLOCK_D': 16}, num_stages=1, num_warps=1),
+        # triton.Config({'BLOCK_C': 16, 'BLOCK_D': 16}, num_stages=1, num_warps=1),
+        triton.Config({'BLOCK_C': 128, 'BLOCK_D': 64}, num_stages=1, num_warps=4),
     ],
     key=['BLOCK_C', 'BLOCK_D'],
 )
@@ -143,7 +144,7 @@ def _chunked_decay(
                     + offs_d[:, None] * k_stride_dim
                     + offs_j[None, :] * k_stride_seq
                 ),
-                mask=(offs_j[:, None] < limit_c) & (offs_d[None, :] < limit_d), 
+                mask=(offs_j[None, :] < limit_c) & (offs_d[:, None] < limit_d), 
                 other=0.0
             ).to(tl.float32)
 
@@ -305,7 +306,7 @@ def softmax_with_decay_fwd(
 
 @triton.autotune(
     [
-        triton.Config({'BLOCK_C': 16, 'BLOCK_D': 16}, num_stages=1, num_warps=1),
+        triton.Config({'BLOCK_C': 128, 'BLOCK_D': 64}, num_stages=1, num_warps=4),
     ],
     key=['BLOCK_C', 'BLOCK_D'],
 )
@@ -766,7 +767,8 @@ def rowwise_bwd(
 
 @triton.autotune(
     [
-        triton.Config({'BLOCK_C': 16, 'BLOCK_D': 16}, num_stages=1, num_warps=1),
+        # triton.Config({'BLOCK_C': 16, 'BLOCK_D': 16}, num_stages=1, num_warps=1),
+        triton.Config({'BLOCK_C': 64, 'BLOCK_D': 32}, num_stages=1, num_warps=2),
     ],
     key=['BLOCK_C', 'BLOCK_D'],
 )
@@ -1243,7 +1245,7 @@ def _rowwise_bwd(
 
                 # see the explaination above
                 - tl.log(
-                    tl.maximum(affinity0, 1e-3)
+                    tl.maximum(affinity0, 1e-4)
                 ) 
             ) 
 
@@ -1410,7 +1412,8 @@ def colwise_bwd(
 
 @triton.autotune(
     [
-        triton.Config({'BLOCK_R': 16, 'BLOCK_D': 16}, num_stages=1, num_warps=1),
+        # triton.Config({'BLOCK_R': 16, 'BLOCK_D': 16}, num_stages=1, num_warps=1),
+        triton.Config({'BLOCK_R': 64, 'BLOCK_D': 64}, num_stages=1, num_warps=4),
     ],
     key=['BLOCK_R', 'BLOCK_D'],
 )

@@ -2,7 +2,39 @@ import torch
 import triton
 import triton.language as tl
 
-CHUNK_SIZE = 16 # TODO: tune this
+from itertools import product
+
+CHUNK_SIZE = 32
+
+CONFIGS = [
+    triton.Config({
+            'BLOCK_C': c, 
+            'BLOCK_D': d,
+        }, 
+        num_stages=s, num_warps=w
+    )
+    for c, d, s, w in product(
+        [16, 32, 64, 128],
+        [16, 32, 64, 128],
+        [0, 2],
+        [2, 4, 8],
+    )
+]
+
+CONFIGS_COL = [
+    triton.Config({
+            'BLOCK_R': c, 
+            'BLOCK_D': d,
+        }, 
+        num_stages=s, num_warps=w
+    )
+    for c, d, s, w in product(
+        [16, 32, 64, 128],
+        [16, 32, 64, 128],
+        [0, 2],
+        [2, 4, 8],
+    )
+]
 
 def chunked_decay(
     keys: torch.Tensor, # b,h,l,d
@@ -55,10 +87,7 @@ def chunked_decay(
 # inspired by Universal_Attention.triton.universal_attention_kernel._universal_attention_fwd_kernel
 
 @triton.autotune(
-    [
-        # triton.Config({'BLOCK_C': 16, 'BLOCK_D': 16}, num_stages=1, num_warps=1),
-        triton.Config({'BLOCK_C': 128, 'BLOCK_D': 64}, num_stages=1, num_warps=4),
-    ],
+    CONFIGS,
     key=['BLOCK_C', 'BLOCK_D'],
 )
 @triton.jit
@@ -305,9 +334,7 @@ def softmax_with_decay_fwd(
     return res
 
 @triton.autotune(
-    [
-        triton.Config({'BLOCK_C': 128, 'BLOCK_D': 64}, num_stages=1, num_warps=4),
-    ],
+    CONFIGS,
     key=['BLOCK_C', 'BLOCK_D'],
 )
 @triton.jit
@@ -727,6 +754,7 @@ def rowwise_bwd(
 
     # NOTE: need to run this thrice, dont have a good way
     # to get both res_dZscore and res_dY_chunked in a single run
+    # for p in [1,2,3]:
     for p in [1,2,3]:
 
         if p == 3:
@@ -766,10 +794,7 @@ def rowwise_bwd(
     return res_dQ, res_dK1, res_dZscore, res_dY_chunked, res_ddest
 
 @triton.autotune(
-    [
-        # triton.Config({'BLOCK_C': 16, 'BLOCK_D': 16}, num_stages=1, num_warps=1),
-        triton.Config({'BLOCK_C': 64, 'BLOCK_D': 32}, num_stages=1, num_warps=2),
-    ],
+    CONFIGS,
     key=['BLOCK_C', 'BLOCK_D'],
 )
 @triton.jit
@@ -1411,10 +1436,7 @@ def colwise_bwd(
     return res_dK2, res_dV, res_dsrc
 
 @triton.autotune(
-    [
-        # triton.Config({'BLOCK_R': 16, 'BLOCK_D': 16}, num_stages=1, num_warps=1),
-        triton.Config({'BLOCK_R': 64, 'BLOCK_D': 64}, num_stages=1, num_warps=4),
-    ],
+    CONFIGS_COL,
     key=['BLOCK_R', 'BLOCK_D'],
 )
 @triton.jit

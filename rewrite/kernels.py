@@ -824,7 +824,7 @@ def _rowwise_bwd(
     keys += pid_b * k_stride_b + hkv * k_stride_h
     values += pid_b * v_stride_b + hkv * v_stride_h
     chunked_decay += pid_b * d_stride_b + hkv * d_stride_h
-    score_denom += pid_b * denom_stride_b + hkv * denom_stride_h
+    score_denom += pid_b * denom_stride_b + pid_h * denom_stride_h
 
     src += pid_b * src_stride_b + hkv * src_stride_h
     dest += pid_b * dest_stride_b + hkv * dest_stride_h
@@ -1464,7 +1464,7 @@ def _colwise_bwd(
     dZScoreSum += pid_b * dZS_stride_b + pid_h * dZS_stride_h
     keys += pid_b * k_stride_b + hkv * k_stride_h
     values += pid_b * v_stride_b + hkv * v_stride_h
-    score_denom += pid_b * denom_stride_b + hkv * denom_stride_h
+    score_denom += pid_b * denom_stride_b + pid_h * denom_stride_h
 
     # - this is the cumulative chunked dY
     chunked_dZ1 += pid_b * dz1_stride_b + pid_h * dz1_stride_h

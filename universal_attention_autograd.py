@@ -55,6 +55,30 @@ def simplest_implementation(
         return targ, denom, decay
     return targ, denom
 
+def simplest_implementation_with_decay(
+    q: torch.Tensor, # b,h,l,d
+    k: torch.Tensor, # b,h,l,d
+    v: torch.Tensor, # b,h,l,d
+    decay: torch.Tensor,
+):
+    # b, h, l, d
+    _, h, l, _ = q.shape
+    _, hkv, _, _ = k.shape
+
+    if hkv < h:
+        k = torch.repeat_interleave(k, h // hkv, dim=1)
+        v = torch.repeat_interleave(v, h // hkv, dim=1)
+        decay = torch.repeat_interleave(decay, h // hkv, dim=1)
+
+    
+    # Compute softmax attention
+    logits = q.matmul(k.transpose(-1,-2)).add(decay)
+    denom = logits.logsumexp(dim=-1)
+    score = logits.sub(denom.unsqueeze(-1))
+    targ = score.exp().matmul(v)
+
+    return targ, denom
+
 # The pytorch autograd version is borrowed from here: 
 # https://github.com/daviswer/torchtitan/blob/sandbox-selfprune-clean-wd/torchtitan/models/llama/utils.py
 

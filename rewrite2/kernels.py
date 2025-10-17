@@ -351,3 +351,264 @@ def _softmax_with_decay_fwd(
             (offs_i[:, None] < limit_r)
         )
     )
+
+def compute_dY(
+    dout: torch.Tensor, # b,h,l,d
+    q: torch.Tensor, # b,h,l,d
+    k: torch.Tensor, # b,h,l,d
+    v: torch.Tensor, # b,h,l,d
+    attn: torch.Tensor,
+    chunk_size: int = None,
+):
+
+    if chunk_size is None:
+        chunk_size = CHUNK_SIZE
+
+    # TODO: check sizes
+    b, nheads, qlen, qdim = q.shape
+    _, kvheads, klen, _ = k.shape
+    _, _, _, vdim = v.shape
+    assert qlen == klen
+    assert nheads % kvheads == 0
+    assert qdim == vdim
+
+    grid = (b, nheads, triton.cdiv(qlen, chunk_size))
+
+    res_dY = torch.zeros(
+        (b, nheads, qlen, klen), 
+        device=q.device, 
+        dtype=torch.float32
+    ) 
+
+    _compute_dY[grid](
+        res_dY, 
+        dout,
+        attn,
+        v,
+        res_dY.stride(0), res_dY.stride(1), res_dY.stride(2), res_dY.stride(3),
+        dout.stride(0), dout.stride(1), dout.stride(2), dout.stride(3),
+        attn.stride(0), attn.stride(1), attn.stride(2), attn.stride(3),
+        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+        seqlen=klen,
+        HEAD_DIM=qdim,
+        group_size=nheads // kvheads,
+        chunk_size=chunk_size,
+    )
+
+    return res_dY
+
+
+@triton.autotune(
+    CONFIGS,
+    key=['BLOCK_C', 'BLOCK_D'],
+)
+@triton.jit
+def _compute_dY(
+    res_dY, 
+    dout, 
+    attn,
+    values,
+    res_dY_stride_b, res_dY_stride_h, res_dY_stride_qseq, 
+    res_dY_stride_kseq,
+    do_stride_b, do_stride_h, do_stride_seq, do_stride_dim,
+    attn_stride_b, attn_stride_h, attn_stride_qseq,  attn_stride_kseq,
+    v_stride_b, v_stride_h, v_stride_seq, v_stride_dim,
+    seqlen: int,
+    group_size: int,
+    chunk_size: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+
+    pid_b = tl.program_id(0) # batch
+    pid_h = tl.program_id(1) # query head
+    hkv = pid_h // group_size # key / value head
+    pid_r = tl.program_id(2) # row chunk
+
+    # offset by batch and head
+    res_dY += pid_b * res_dY_stride_b + pid_h * res_dY_stride_h
+    dout += pid_b * do_stride_b + pid_h * do_stride_h
+    attn += pid_b * attn_stride_b + pid_h * attn_stride_h
+    values += pid_b * v_stride_b + hkv * v_stride_h
+
+    # rows
+    res_dY_r = res_dY + pid_r * chunk_size * res_dY_stride_qseq
+    attn_r = attn + pid_r * chunk_size * attn_stride_qseq
+    dout_r = dout + pid_r * chunk_size * do_stride_seq
+
+    # we allow row chunk size to differ from column chunk,
+    # so we 
+    # - a the pid_r-th row chunk will take up (pid_r * chunk_size) columns
+    # - so 
+    nC = tl.cdiv(
+        (pid_r + 1) * chunk_size - 1, BLOCK_C
+    ) # number of column chunks to process (including the spillover)
+    nD = tl.cdiv(HEAD_DIM, BLOCK_D)
+
+    offs_i = tl.arange(0, chunk_size)
+    offs_j = tl.arange(0, BLOCK_C) # columns
+    offs_d = tl.arange(0, BLOCK_D)
+    limit_r = seqlen - pid_r * chunk_size # row limit
+    limit_c = seqlen # col_limit
+
+    # in the first pass we compute dZScore
+    dZScore_sum = tl.zeros([chunk_size], dtype=tl.float32)
+
+    # must define here for compilation purposes
+    dZ = tl.zeros((chunk_size, BLOCK_C), dtype=tl.float32)
+    attn_mat = tl.load(
+        (
+            attn_r 
+            + offs_i[:, None] * attn_stride_qseq
+            + offs_j[None, :] * attn_stride_kseq
+        ),
+        mask=(
+            (offs_i[:, None] < limit_r) &
+            (offs_j[None, :] < limit_c)
+        ),
+        other=0.0
+    ).to(tl.float32)
+
+    # process the columns
+    for c in range(0, nC):
+
+        dZ = tl.zeros((chunk_size, BLOCK_C), dtype=tl.float32)
+
+        do_mat_ptr = dout_r
+        vt_mat_ptr = values
+
+        # ------- dZ,dZScore -------
+        limit_d = HEAD_DIM # dims
+        for _ in range(0, nD):
+
+            # for dz
+            # NOTE: we assme now dim(do) = dim(v) = HEAD_DIM
+            do_mat = tl.load(
+                (
+                    do_mat_ptr 
+                    + offs_i[:, None] * do_stride_seq
+                    + offs_d[None, :] * do_stride_dim
+                ),
+                mask=(offs_i[:, None] < limit_r) & (offs_d[None, :] < limit_d), 
+                other=0.0
+            ).to(tl.float32)
+
+            # for dZ
+            vt_mat = tl.load(
+                (
+                    vt_mat_ptr 
+                    + offs_d[:, None] * v_stride_dim
+                    + offs_j[None, :] * v_stride_seq
+                ),
+                mask= (offs_d[:, None] < limit_d) & (offs_j[None, :] < limit_c),
+                other=0.0
+            ).to(tl.float32)
+
+            dZ += tl.dot(do_mat, vt_mat)
+
+            # handle the limit
+            limit_d -= BLOCK_D
+
+            # handle the pointers
+            do_mat_ptr += BLOCK_D * do_stride_dim
+            vt_mat_ptr += BLOCK_D * v_stride_dim
+
+        # dZ * Z
+        dZ *= attn_mat
+
+        # store dZ *Z here first
+        tl.store(
+            (
+                res_dY_r
+                + offs_i[:, None] * res_dY_stride_qseq
+                + offs_j[None, :] * res_dY_stride_kseq
+            ),
+            dZ,
+            mask=(
+                (offs_i[:, None] < limit_r) &
+                (offs_j[None, :] < limit_c)
+            )
+        )
+
+        # compute (dZ * Z).sum(-1)
+        dZScore_sum += tl.sum(dZ, axis=1)
+
+        # move pointer with column chunk
+        values += BLOCK_C * v_stride_seq
+        attn_r += BLOCK_C * attn_stride_kseq
+        res_dY_r += BLOCK_C * res_dY_stride_kseq
+
+        # handle the limit
+        limit_c -= BLOCK_C
+
+        # for the next iteration
+        if c < (nC-1):
+            attn_mat = tl.load(
+                (
+                attn_r 
+                    + offs_i[:, None] * attn_stride_qseq
+                    + offs_j[None, :] * attn_stride_kseq
+                ),
+                mask=(
+                    (offs_i[:, None] < limit_r) &
+                    (offs_j[None, :] < limit_c)
+                ),
+                other=0.0
+            ).to(tl.float32)
+
+    # go through again and update the 
+    # - dZZ - dZScore_sum * Z
+    # - go backwards
+    for c in range(0, nC):
+
+        # move pointer (backward) with column chunk
+        attn_r -= BLOCK_C * attn_stride_kseq
+        res_dY_r -= BLOCK_C * res_dY_stride_kseq
+
+        # handle the limit
+        limit_c += BLOCK_C
+
+        if c > 0:
+            attn_mat = tl.load(
+                (
+                    attn_r 
+                    + offs_i[:, None] * attn_stride_qseq
+                    + offs_j[None, :] * attn_stride_kseq
+                ),
+                mask=(
+                    (offs_i[:, None] < limit_r) &
+                    (offs_j[None, :] < limit_c)
+                ),
+                other=0.0
+            ).to(tl.float32)
+
+            # remember dZZ was saved here
+            dZ = tl.load(
+                (
+                    res_dY_r 
+                    + offs_i[:, None] * attn_stride_qseq
+                    + offs_j[None, :] * attn_stride_kseq
+                ),
+                mask=(
+                    (offs_i[:, None] < limit_r) &
+                    (offs_j[None, :] < limit_c)
+                ),
+                other=0.0
+            ).to(tl.float32)
+
+        # update the result
+        tl.store(
+            (
+                res_dY_r
+                + offs_i[:, None] * res_dY_stride_qseq
+                + offs_j[None, :] * res_dY_stride_kseq
+            ),
+            dZ - (
+                dZScore_sum[:, None] * attn_mat
+            ),
+            mask=(
+                (offs_i[:, None] < limit_r) &
+                (offs_j[None, :] < limit_c)
+            )
+        )

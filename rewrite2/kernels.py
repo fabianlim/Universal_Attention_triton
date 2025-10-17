@@ -371,7 +371,7 @@ def compute_dYdQ(
     k: torch.Tensor, # b,h,l,d
     v: torch.Tensor, # b,h,l,d
     attn: torch.Tensor,
-    chunk_size: int = None,
+    chunk_size: int = CHUNK_SIZE,
 ):
 
     if chunk_size is None:
@@ -677,7 +677,7 @@ def compute_dVdK(
     dY: torch.Tensor, # b,h,l,l
     attn: torch.Tensor, # b,h,l,l
     kvheads: int,
-    chunk_size: int = None,
+    chunk_size: int = CHUNK_SIZE,
 ):
     if chunk_size is None:
         chunk_size = CHUNK_SIZE

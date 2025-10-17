@@ -1,5 +1,6 @@
 from torch.autograd import Function
 from .kernels import softmax_with_decay_fwd
+from .kernels import compute_dYdQ, compute_dVdK
 
 class UniversalAttention(Function):
 
@@ -18,4 +19,22 @@ class UniversalAttention(Function):
 
     @staticmethod
     def backward(ctx, dout):
-        pass
+
+        (
+            k, v, q, attn
+        ) = ctx.saved_tensors
+
+        _, kvheads, _, _ = k.shape
+
+        dY, dQ = compute_dYdQ(
+            dout, q, k, v, attn, 
+        )
+
+        dV, dK = compute_dVdK(
+            dout, q, dY, attn, 
+            kvheads=kvheads,
+        )
+
+        # NOTE: missing one component of dK
+        # - dY is the gradient for decay
+        return dK, dV, dQ, dY

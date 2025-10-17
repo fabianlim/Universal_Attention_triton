@@ -97,13 +97,14 @@ def softmax_with_decay_fwd(
             c*chunk_size:(c+1)*chunk_size,
             :(c+1)
         ] # b, h, chunk, c * chunks
-        denom /= denom[...,c:(c+1)] # norm by the final one
+        denom -= denom[...,c:(c+1)] # norm by the final one
         res_attn[
             ..., 
             c*chunk_size:(c+1)*chunk_size,
             :(c+1)*chunk_size
         ] *= torch.repeat_interleave(
-            denom, chunk_size, dim=-1
+            torch.exp(denom), # denom is in log
+            chunk_size, dim=-1
         ) # re-normalize
 
     return res, res_attn
@@ -311,8 +312,7 @@ def _softmax_with_decay_fwd(
         # max normalization
         tl.store(
             res_denom_r + offs_i * res_denom_stride_qseq,
-            # score_max + tl.log(score_denom),
-            tl.exp(score_max) * score_denom,
+            score_max + tl.log(score_denom),
             mask=offs_i < limit_r
         )
 

@@ -492,7 +492,7 @@ def _softmax_with_decay_fwd(
             # handle the pointers
             k_mat_ptr += BLOCK_D * k_stride_dim
             kt_mat_ptr += BLOCK_D * k_stride_dim
-            q_mat_ptr += BLOCK_D * k_stride_dim
+            q_mat_ptr += BLOCK_D * q_stride_dim
 
         # .relu().pow(2/3)
         affinity = tl.exp2(tl.log2(tl.maximum(affinity, 0.0)) * 2.0 / 3.0)

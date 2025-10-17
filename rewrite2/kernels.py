@@ -20,6 +20,19 @@ CONFIGS = [
     )
 ]
 
+CONFIGS_COL = [
+    triton.Config({
+            'BLOCK_R': c, 
+        }, 
+        num_stages=s, num_warps=w
+    )
+    for c, s, w in product(
+        [16],
+        [0],
+        [1],
+    )
+]
+
 def softmax_with_decay_fwd(
     q: torch.Tensor, # b,h,l,d
     k: torch.Tensor, # b,h,l,d
@@ -655,5 +668,220 @@ def _compute_dYdQ(
         acc,
         mask=(
             (offs_i[:, None] < limit_r)
+        )
+    )
+
+def compute_dVdK(
+    dout: torch.Tensor, # b,h,l,d
+    q: torch.Tensor, # b,h,l,d
+    dY: torch.Tensor, # b,h,l,l
+    attn: torch.Tensor, # b,h,l,l
+    kvheads: int,
+    chunk_size: int = None,
+):
+    if chunk_size is None:
+        chunk_size = CHUNK_SIZE
+
+    # TODO: check sizes
+    b, nheads, qlen, qdim = q.shape
+    _, _, _, vdim = dout.shape
+
+    grid = (b, nheads, triton.cdiv(qlen, chunk_size))
+
+    res_dV = torch.zeros(
+        (b, nheads, qlen, vdim), 
+        device=q.device, 
+        dtype=torch.float32
+    ) 
+
+    res_dK = torch.zeros(
+        (b, nheads, qlen, qdim), # assume same
+        device=q.device, 
+        dtype=torch.float32
+    ) 
+
+    _compute_dVdK[grid](
+        res_dV, res_dK,
+        dout, dY, attn,
+        q,
+        res_dV.stride(0), res_dV.stride(1), res_dV.stride(2), res_dV.stride(3),
+        res_dK.stride(0), res_dK.stride(1), res_dK.stride(2), res_dK.stride(3),
+        dout.stride(0), dout.stride(1), dout.stride(2), dout.stride(3),
+        dY.stride(0), dY.stride(1), dY.stride(2), dY.stride(3),
+        attn.stride(0), attn.stride(1), attn.stride(2), attn.stride(3),
+        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+        seqlen=qlen,
+        HEAD_DIM=vdim,
+        group_size=nheads // kvheads,
+        chunk_size=chunk_size,
+    )
+
+    # NOTE: need to collapse heads later
+
+    return res_dV, res_dK
+
+@triton.autotune(
+    CONFIGS_COL,
+    key=['BLOCK_R'],
+)
+@triton.jit
+def _compute_dVdK(
+    res_dV,
+    res_dK,
+    dout, 
+    dY, 
+    attn,
+    queries,
+    res_dV_stride_b, res_dV_stride_h, res_dV_stride_seq, res_dV_stride_dim,
+    res_dK_stride_b, res_dK_stride_h, res_dK_stride_seq, res_dK_stride_dim,
+    do_stride_b, do_stride_h, do_stride_seq, do_stride_dim,
+    dY_stride_b, dY_stride_h, dY_stride_qseq, dY_stride_kseq,
+    attn_stride_b, attn_stride_h, attn_stride_qseq,  attn_stride_kseq,
+    q_stride_b, q_stride_h, q_stride_seq, q_stride_dim,
+    seqlen: int,
+    group_size: int,
+    chunk_size: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    pid_b = tl.program_id(0) # batch
+    pid_h = tl.program_id(1) # query head
+    hkv = pid_h // group_size # key / value head
+    pid_c = tl.program_id(2) # col chunk
+
+    # offset by batch and head
+    res_dV += pid_b * res_dV_stride_b + pid_h * res_dV_stride_h
+    res_dK += pid_b * res_dK_stride_b + pid_h * res_dK_stride_h
+    dout += pid_b * do_stride_b + pid_h * do_stride_h
+    dY += pid_b * dY_stride_b + pid_h * dY_stride_h
+    attn += pid_b * attn_stride_b + pid_h * attn_stride_h
+    queries += pid_b * q_stride_b + hkv * q_stride_h
+
+    # columns
+    dout_r = dout + pid_c * chunk_size * do_stride_seq
+    queries_r = queries + pid_c * chunk_size * q_stride_seq
+    res_dV_c = res_dV + pid_c * chunk_size * res_dV_stride_seq
+    res_dK_c = res_dK + pid_c * chunk_size * res_dK_stride_seq
+
+    # - start in the correct block
+    dY_c = dY + pid_c * chunk_size * (dY_stride_qseq + dY_stride_kseq)
+    attn_c = attn + pid_c * chunk_size * (attn_stride_qseq + attn_stride_kseq)
+
+    # we allow row chunk size to differ from column chunk,
+    # so we 
+    # - a the pid_r-th row chunk will take up (pid_r * chunk_size) columns
+    # - so 
+    nR = tl.cdiv(
+        seqlen - pid_c * chunk_size, BLOCK_R
+    ) # number of column chunks to process (including the spillover)
+
+    # load scales
+    offs_i = tl.arange(0, BLOCK_R) # rows
+    offs_j = tl.arange(0, chunk_size)
+    offs_v = tl.arange(0, HEAD_DIM)
+    limit_r = seqlen # row_limit
+    limit_c = seqlen - pid_c * chunk_size # col limit
+
+    # computation of dK_2
+    acc = tl.zeros([HEAD_DIM, chunk_size], dtype=tl.float32)
+
+    # computation of dV
+    acc2 = tl.zeros([HEAD_DIM, chunk_size], dtype=tl.float32)
+
+    # process the rows
+    for r in range(0, nR):
+
+        dot_mat = tl.load(
+            (
+                dout_r 
+                + offs_v[:, None] * do_stride_dim # NOTE: assumed same
+                + offs_i[None, :] * do_stride_seq
+            ),
+            mask=(offs_i[None, :] < limit_r),
+            other=0.0
+        ).to(tl.float32)
+
+        attn_mat = tl.load(
+            (
+                attn_c 
+                + offs_i[:, None] * attn_stride_qseq
+                + offs_j[None, :] * attn_stride_kseq
+            ),
+            mask=(
+                (offs_i[:, None] < limit_r) &
+                (offs_j[None, :] < limit_c)
+            ),
+            other=0.0
+        ).to(tl.float32)
+
+        # dV
+        # - score should have zeros in appropriate places
+        acc2 += tl.dot(dot_mat, attn_mat)
+
+        qt_mat = tl.load(
+            (
+                queries_r
+                + offs_v[:, None] * q_stride_dim # NOTE: assumed same
+                + offs_i[None, :] * q_stride_seq
+            ),
+            mask=(offs_i[None, :] < limit_r),
+            other=0.0
+        ).to(tl.float32)
+
+        dY_mat = tl.load(
+            (
+                dY_c 
+                + offs_i[:, None] * dY_stride_qseq
+                + offs_j[None, :] * dY_stride_kseq
+            ),
+            mask=(
+                (offs_i[:, None] < limit_r) &
+                (offs_j[None, :] < limit_c)
+            ),
+            other=0.0
+        ).to(tl.float32)
+
+        # dK
+        # - score (and therefore dZScore) should have
+        #   zeros in appropriate places
+        acc += tl.dot(qt_mat, dY_mat)
+
+        # movements
+        queries_r += BLOCK_R * q_stride_seq
+        dY_c += BLOCK_R * dY_stride_qseq
+        attn_c += BLOCK_R * attn_stride_qseq
+        dout_r += BLOCK_R * do_stride_seq
+
+        # handle the limit
+        limit_r -= BLOCK_R
+
+    
+    # if pid_b == 0 and pid_h == 0 and pid_c == 2:
+    # if pid_b == 0 and pid_h == 0 and pid_c == 1:
+    #     print ("acc2", acc2)
+
+    # -  DONE WITH ROW CHUNK LOOPS - 
+
+    tl.store(
+        (
+            res_dV_c 
+            + offs_v[:, None] * res_dV_stride_dim
+            + offs_j[None, :] * res_dV_stride_seq
+        ),
+        acc2,
+        mask=(
+            (offs_j[None, :] < limit_c)
+        )
+    )
+
+    tl.store(
+        (
+            res_dK_c 
+            + offs_v[:, None] * res_dK_stride_dim
+            + offs_j[None, :] * res_dK_stride_seq
+        ),
+        acc,
+        mask=(
+            (offs_j[None, :] < limit_c)
         )
     )

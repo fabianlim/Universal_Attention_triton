@@ -352,7 +352,7 @@ def _softmax_with_decay_fwd(
         )
     )
 
-def compute_dY(
+def compute_dYdQ(
     dout: torch.Tensor, # b,h,l,d
     q: torch.Tensor, # b,h,l,d
     k: torch.Tensor, # b,h,l,d
@@ -366,7 +366,7 @@ def compute_dY(
 
     # TODO: check sizes
     b, nheads, qlen, qdim = q.shape
-    _, kvheads, klen, _ = k.shape
+    _, kvheads, klen, kdim = k.shape
     _, _, _, vdim = v.shape
     assert qlen == klen
     assert nheads % kvheads == 0
@@ -380,22 +380,31 @@ def compute_dY(
         dtype=torch.float32
     ) 
 
-    _compute_dY[grid](
+    res_dQ = torch.zeros(
+        (b, nheads, qlen, qdim), 
+        device=q.device, 
+        dtype=torch.float32
+    ) 
+
+    _compute_dYdQ[grid](
         res_dY, 
+        res_dQ,
         dout,
         attn,
-        v,
+        v, k,
         res_dY.stride(0), res_dY.stride(1), res_dY.stride(2), res_dY.stride(3),
+        res_dQ.stride(0), res_dQ.stride(1), res_dQ.stride(2), res_dQ.stride(3),
         dout.stride(0), dout.stride(1), dout.stride(2), dout.stride(3),
         attn.stride(0), attn.stride(1), attn.stride(2), attn.stride(3),
         v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
         seqlen=klen,
         HEAD_DIM=qdim,
         group_size=nheads // kvheads,
         chunk_size=chunk_size,
     )
 
-    return res_dY
+    return res_dY, res_dQ
 
 
 @triton.autotune(
@@ -403,16 +412,18 @@ def compute_dY(
     key=['BLOCK_C', 'BLOCK_D'],
 )
 @triton.jit
-def _compute_dY(
+def _compute_dYdQ(
     res_dY, 
+    res_dQ, 
     dout, 
     attn,
-    values,
-    res_dY_stride_b, res_dY_stride_h, res_dY_stride_qseq, 
-    res_dY_stride_kseq,
+    values, keys,
+    res_dY_stride_b, res_dY_stride_h, res_dY_stride_qseq, res_dY_stride_kseq,
+    res_dQ_stride_b, res_dQ_stride_h, res_dQ_stride_qseq, res_dQ_stride_dim,
     do_stride_b, do_stride_h, do_stride_seq, do_stride_dim,
     attn_stride_b, attn_stride_h, attn_stride_qseq,  attn_stride_kseq,
     v_stride_b, v_stride_h, v_stride_seq, v_stride_dim,
+    k_stride_b, k_stride_h, k_stride_seq, k_stride_dim,
     seqlen: int,
     group_size: int,
     chunk_size: tl.constexpr,
@@ -428,12 +439,15 @@ def _compute_dY(
 
     # offset by batch and head
     res_dY += pid_b * res_dY_stride_b + pid_h * res_dY_stride_h
+    res_dQ += pid_b * res_dQ_stride_b + pid_h * res_dQ_stride_h
     dout += pid_b * do_stride_b + pid_h * do_stride_h
     attn += pid_b * attn_stride_b + pid_h * attn_stride_h
     values += pid_b * v_stride_b + hkv * v_stride_h
+    keys += pid_b * k_stride_b + hkv * k_stride_h
 
     # rows
     res_dY_r = res_dY + pid_r * chunk_size * res_dY_stride_qseq
+    res_dQ_r = res_dQ + pid_r * chunk_size * res_dQ_stride_qseq
     attn_r = attn + pid_r * chunk_size * attn_stride_qseq
     dout_r = dout + pid_r * chunk_size * do_stride_seq
 
@@ -449,6 +463,7 @@ def _compute_dY(
     offs_i = tl.arange(0, chunk_size)
     offs_j = tl.arange(0, BLOCK_C) # columns
     offs_d = tl.arange(0, BLOCK_D)
+    offs_v = tl.arange(0, HEAD_DIM)
     limit_r = seqlen - pid_r * chunk_size # row limit
     limit_c = seqlen # col_limit
 
@@ -557,10 +572,14 @@ def _compute_dY(
                 other=0.0
             ).to(tl.float32)
 
-    # go through again and update the 
+    # for dQ
+    acc = tl.zeros([chunk_size, HEAD_DIM], dtype=tl.float32)
+
+    # go through again (backwards) and update the 
     # - dZZ - dZScore_sum * Z
-    # - go backwards
     for c in range(0, nC):
+
+        kc_mat_ptr = keys
 
         # move pointer (backward) with column chunk
         attn_r -= BLOCK_C * attn_stride_kseq
@@ -597,6 +616,21 @@ def _compute_dY(
                 other=0.0
             ).to(tl.float32)
 
+        # dY
+        dY = dZ - dZScore_sum[:, None] * attn_mat
+
+        # dQ
+        k_mat = tl.load(
+            (
+                kc_mat_ptr 
+                + offs_j[:, None] * k_stride_seq
+                + offs_v[None, :] * k_stride_dim # NOTE: assumed same
+            ),
+            mask=(offs_j[:, None] < limit_c),
+            other=0.0
+        ).to(tl.float32)
+        acc += tl.dot(dY, k_mat)
+
         # update the result
         tl.store(
             (
@@ -604,11 +638,22 @@ def _compute_dY(
                 + offs_i[:, None] * res_dY_stride_qseq
                 + offs_j[None, :] * res_dY_stride_kseq
             ),
-            dZ - (
-                dZScore_sum[:, None] * attn_mat
-            ),
+            dY,
             mask=(
                 (offs_i[:, None] < limit_r) &
                 (offs_j[None, :] < limit_c)
             )
         )
+
+    # update dQ
+    tl.store(
+        (
+            res_dQ_r 
+            + offs_i[:, None] * res_dQ_stride_qseq
+            + offs_v[None, :] * res_dQ_stride_dim
+        ),
+        acc,
+        mask=(
+            (offs_i[:, None] < limit_r)
+        )
+    )

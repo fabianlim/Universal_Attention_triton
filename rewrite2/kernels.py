@@ -5,15 +5,18 @@ from itertools import product
 
 CHUNK_SIZE = 16
 
+SMALLEST_BLOCK_C = 16
 CONFIGS = [
     triton.Config({
+            'chunk_size': chunk,
             'BLOCK_C': c, 
             'BLOCK_D': d,
         }, 
         num_stages=s, num_warps=w
     )
-    for c, d, s, w in product(
+    for chunk, c, d, s, w in product(
         [16],
+        [SMALLEST_BLOCK_C],
         [16],
         [0],
         [1],
@@ -22,11 +25,13 @@ CONFIGS = [
 
 CONFIGS_COL = [
     triton.Config({
-            'BLOCK_R': c, 
+            'chunk_size': chunk,
+            'BLOCK_R': r, 
         }, 
         num_stages=s, num_warps=w
     )
-    for c, s, w in product(
+    for chunk, r, s, w in product(
+        [16],
         [16],
         [0],
         [1],
@@ -38,13 +43,9 @@ def softmax_with_decay_fwd(
     k: torch.Tensor, # b,h,l,d
     v: torch.Tensor, # b,h,l,d
     decay: torch.Tensor,
-    chunk_size: int = CHUNK_SIZE,
-    smallest_block_c: int = 16,
+    smallest_block_c: int = SMALLEST_BLOCK_C,
     return_denom: bool = False,
 ):
-    if chunk_size is None:
-        chunk_size = CHUNK_SIZE
-
     # TODO: check sizes
     b, nheads, qlen, qdim = q.shape
     _, kvheads, klen, _ = k.shape
@@ -53,8 +54,7 @@ def softmax_with_decay_fwd(
     assert nheads % kvheads == 0
     assert qdim == vdim
 
-    num_chunks = triton.cdiv(klen, chunk_size)
-    grid = (b, nheads, num_chunks)
+    grid = lambda META: (b, nheads, triton.cdiv(klen, META['chunk_size']))
 
     res = torch.zeros(
         (b, nheads, qlen, vdim), 
@@ -98,7 +98,6 @@ def softmax_with_decay_fwd(
         seqlen=klen,
         HEAD_DIM=qdim,
         group_size=nheads // kvheads,
-        chunk_size=chunk_size,
     )
 
     if return_denom:
@@ -107,7 +106,7 @@ def softmax_with_decay_fwd(
 
 @triton.autotune(
     CONFIGS,
-    key=['BLOCK_C', 'BLOCK_D'],
+    key=['chunk_size', 'BLOCK_C', 'BLOCK_D'],
 )
 @triton.jit
 def _softmax_with_decay_fwd(
@@ -404,11 +403,7 @@ def compute_dYdQ(
     k: torch.Tensor, # b,h,l,d
     v: torch.Tensor, # b,h,l,d
     attn: torch.Tensor,
-    chunk_size: int = CHUNK_SIZE,
 ):
-
-    if chunk_size is None:
-        chunk_size = CHUNK_SIZE
 
     # TODO: check sizes
     b, nheads, qlen, qdim = q.shape
@@ -418,7 +413,7 @@ def compute_dYdQ(
     assert nheads % kvheads == 0
     assert qdim == vdim
 
-    grid = (b, nheads, triton.cdiv(qlen, chunk_size))
+    grid = lambda META: (b, nheads, triton.cdiv(klen, META['chunk_size']))
 
     res_dY = torch.zeros(
         (b, nheads, qlen, klen), 
@@ -447,7 +442,6 @@ def compute_dYdQ(
         seqlen=klen,
         HEAD_DIM=qdim,
         group_size=nheads // kvheads,
-        chunk_size=chunk_size,
     )
 
     return res_dY, res_dQ
@@ -455,7 +449,7 @@ def compute_dYdQ(
 
 @triton.autotune(
     CONFIGS,
-    key=['BLOCK_C', 'BLOCK_D'],
+    key=['chunk_size', 'BLOCK_C', 'BLOCK_D'],
 )
 @triton.jit
 def _compute_dYdQ(
@@ -710,25 +704,22 @@ def compute_dVdK(
     dY: torch.Tensor, # b,h,l,l
     attn: torch.Tensor, # b,h,l,l
     kvheads: int,
-    chunk_size: int = CHUNK_SIZE,
 ):
-    if chunk_size is None:
-        chunk_size = CHUNK_SIZE
 
     # TODO: check sizes
     b, nheads, qlen, qdim = q.shape
-    _, _, _, vdim = dout.shape
+    _, _, dolen, vdim = dout.shape
 
-    grid = (b, nheads, triton.cdiv(qlen, chunk_size))
+    grid = lambda META: (b, nheads, triton.cdiv(dolen, META['chunk_size']))
 
     res_dV = torch.zeros(
-        (b, nheads, qlen, vdim), 
+        (b, nheads, dolen, vdim), 
         device=q.device, 
         dtype=torch.float32
     ) 
 
     res_dK = torch.zeros(
-        (b, nheads, qlen, qdim), # assume same
+        (b, nheads, dolen, qdim), # assume same
         device=q.device, 
         dtype=torch.float32
     ) 
@@ -746,7 +737,6 @@ def compute_dVdK(
         seqlen=qlen,
         HEAD_DIM=vdim,
         group_size=nheads // kvheads,
-        chunk_size=chunk_size,
     )
 
     # NOTE: need to collapse heads later

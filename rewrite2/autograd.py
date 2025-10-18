@@ -24,7 +24,8 @@ class UniversalAttention(Function):
             k, v, q, attn
         ) = ctx.saved_tensors
 
-        _, kvheads, _, _ = k.shape
+        b, kvheads, l, d = k.shape
+
 
         dY, dQ = compute_dYdQ(
             dout, q, k, v, attn, 
@@ -34,6 +35,11 @@ class UniversalAttention(Function):
             dout, q, dY, attn, 
             kvheads=kvheads,
         )
+
+        dY = dY.view(b, kvheads, -1, l, l).sum(2)
+        dK = dK.view(b, kvheads, -1, l, d).sum(2)
+        dV = dV.view(b, kvheads, -1, l, d).sum(2)
+
 
         # NOTE: missing one component of dK
         # - dY is the gradient for decay

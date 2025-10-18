@@ -39,6 +39,7 @@ def softmax_with_decay_fwd(
     v: torch.Tensor, # b,h,l,d
     decay: torch.Tensor,
     chunk_size: int = CHUNK_SIZE,
+    smallest_block_c: int = 16,
     return_denom: bool = False,
 ):
     if chunk_size is None:
@@ -66,12 +67,16 @@ def softmax_with_decay_fwd(
         dtype=torch.float32
     ) 
 
-    # need to use this to renorm the attn later
+    # NOTE: dont really have a good solution
+    # for this. 
+    # - dont really need that this much memory
+    # - but its troublesome to set the BLOCK_C
+    #   value here, 
     res_denom = torch.zeros(
         (
             b, nheads,  
             qlen,
-            num_chunks,
+            klen // smallest_block_c
         ), 
         device=q.device, 
         dtype=torch.float32
@@ -98,28 +103,6 @@ def softmax_with_decay_fwd(
 
     if return_denom:
         return res, res_attn, res_denom
-
-    # NOTE: this will cause problems if chunk_size
-    # does not divide qlen
-    assert qlen % chunk_size == 0
-    # NOTE: plan to write this into a kernel
-    # normalize each row chunk's attn weights
-    for c in range(num_chunks):
-        denom = res_denom[
-            ...,
-            c*chunk_size:(c+1)*chunk_size,
-            :(c+1)
-        ] # b, h, chunk, c * chunks
-        denom -= denom[...,c:(c+1)] # norm by the final one
-        res_attn[
-            ..., 
-            c*chunk_size:(c+1)*chunk_size,
-            :(c+1)*chunk_size
-        ] *= torch.repeat_interleave(
-            torch.exp(denom), # denom is in log
-            chunk_size, dim=-1
-        ) # re-normalize
-
     return res, res_attn
 
 @triton.autotune(
@@ -289,6 +272,7 @@ def _softmax_with_decay_fwd(
             score - score_max[:, None]
         ) # exp(q^T k - m_i)
 
+
         # - similarly, we handle this boundary 
         #   so as to not participate in the tl.sum below
         if limit_c < BLOCK_C:
@@ -323,6 +307,7 @@ def _softmax_with_decay_fwd(
 
         # this is the equiv norm without the 
         # max normalization
+        # NOTE: the last store is not useful
         tl.store(
             res_denom_r + offs_i * res_denom_stride_qseq,
             score_max + tl.log(score_denom),
@@ -345,11 +330,59 @@ def _softmax_with_decay_fwd(
         # move pointer with column chunk
         keys += BLOCK_C * k_stride_seq
         values += BLOCK_C * v_stride_seq
-        res_attn_r += res_attn_stride_kseq * chunk_size
+        res_attn_r += BLOCK_C * res_attn_stride_kseq
         res_denom_r += res_attn_stride_chunk
+        decay_r += BLOCK_C * d_stride_kseq
 
         # handle the limit
         limit_c -= BLOCK_C
+
+    # go through again (backwards) and update the 
+    # attn weights
+    score_denom_corrected = score_max + tl.log(score_denom) 
+    for c in range(0, nC):
+
+        res_attn_r -= BLOCK_C * res_attn_stride_kseq
+        res_denom_r -= res_attn_stride_chunk
+
+        # handle the limit
+        limit_c += BLOCK_C
+
+        if c > 0:
+            attn_mat = tl.load(
+                (
+                    res_attn_r 
+                    + offs_i[:, None] * res_attn_stride_qseq
+                    + offs_j[None, :] * res_attn_stride_kseq
+                ),
+                mask=(
+                    (offs_i[:, None] < limit_r) &
+                    (offs_j[None, :] < limit_c)
+                ),
+                other=0.0
+            ).to(tl.float32)
+
+            old_denom = tl.load(
+                res_denom_r + offs_i * res_denom_stride_qseq,
+                mask=offs_i < limit_r,
+                other=0.0
+            )
+
+            # renormalization factor
+            old_denom -= score_denom_corrected
+
+            tl.store(
+                (
+                    res_attn_r
+                    + offs_i[:, None] * res_attn_stride_qseq
+                    + offs_j[None, :] * res_attn_stride_kseq
+                ),
+                attn_mat * tl.exp(old_denom)[:, None],
+                mask=(
+                    (offs_i[:, None] < limit_r) &
+                    (offs_j[None, :] < limit_c)
+                )
+            )
 
     # -  DONE WITH COL CHUNK LOOPS - 
 
@@ -587,16 +620,16 @@ def _compute_dYdQ(
 
     # for dQ
     acc = tl.zeros([chunk_size, HEAD_DIM], dtype=tl.float32)
+    keys += nC * BLOCK_C * k_stride_seq
 
     # go through again (backwards) and update the 
     # - dZZ - dZScore_sum * Z
     for c in range(0, nC):
 
-        kc_mat_ptr = keys
-
         # move pointer (backward) with column chunk
         attn_r -= BLOCK_C * attn_stride_kseq
         res_dY_r -= BLOCK_C * res_dY_stride_kseq
+        keys -= BLOCK_C * k_stride_seq
 
         # handle the limit
         limit_c += BLOCK_C
@@ -635,7 +668,7 @@ def _compute_dYdQ(
         # dQ
         k_mat = tl.load(
             (
-                kc_mat_ptr 
+               keys 
                 + offs_j[:, None] * k_stride_seq
                 + offs_v[None, :] * k_stride_dim # NOTE: assumed same
             ),

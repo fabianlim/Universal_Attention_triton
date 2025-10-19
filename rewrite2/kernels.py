@@ -3,8 +3,6 @@ import triton
 import triton.language as tl
 from itertools import product
 
-CHUNK_SIZE = 16
-
 SMALLEST_BLOCK_C = 16
 CONFIGS = [
     triton.Config({
@@ -15,11 +13,11 @@ CONFIGS = [
         num_stages=s, num_warps=w
     )
     for chunk, c, d, s, w in product(
-        [16],
-        [SMALLEST_BLOCK_C],
-        [16],
+        [16, 32, 64],
+        [SMALLEST_BLOCK_C, 32, 64],
+        [16, 32, 64],
         [0],
-        [1],
+        [1,2,4,8],
     )
 ]
 
@@ -31,10 +29,10 @@ CONFIGS_COL = [
         num_stages=s, num_warps=w
     )
     for chunk, r, s, w in product(
-        [16],
-        [16],
+        [16, 32],
+        [16, 32],
         [0],
-        [1],
+        [1,4,8],
     )
 ]
 

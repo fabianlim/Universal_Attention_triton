@@ -1,6 +1,6 @@
 from torch.autograd import Function
-from .kernels import softmax_with_decay_fwd
-from .kernels import compute_dYdQ, compute_dVdK
+from Universal_Attention_triton.rewrite2.kernels import softmax_with_decay_fwd
+from Universal_Attention_triton.rewrite2.kernels import compute_dYdQ, compute_dVdK
 
 class UniversalAttention(Function):
 

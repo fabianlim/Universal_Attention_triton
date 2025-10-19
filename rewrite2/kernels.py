@@ -29,11 +29,12 @@ CONFIGS_COL = [
         num_stages=s, num_warps=w
     )
     for chunk, r, s, w in product(
-        [16, 32],
-        [16, 32],
+        [16, 32, 64],
+        [16, 32, 64],
         [0],
-        [1,4,8],
+        [1, 2, 4, 8],
     )
+    if chunk % r == 0
 ]
 
 def softmax_with_decay_fwd(
@@ -776,7 +777,7 @@ def _compute_dVdK(
     dout += pid_b * do_stride_b + pid_h * do_stride_h
     dY += pid_b * dY_stride_b + pid_h * dY_stride_h
     attn += pid_b * attn_stride_b + pid_h * attn_stride_h
-    queries += pid_b * q_stride_b + hkv * q_stride_h
+    queries += pid_b * q_stride_b + pid_h * q_stride_h
 
     # columns
     dout_r = dout + pid_c * chunk_size * do_stride_seq
@@ -876,10 +877,6 @@ def _compute_dVdK(
         # handle the limit
         limit_r -= BLOCK_R
 
-    
-    # if pid_b == 0 and pid_h == 0 and pid_c == 2:
-    # if pid_b == 0 and pid_h == 0 and pid_c == 1:
-    #     print ("acc2", acc2)
 
     # -  DONE WITH ROW CHUNK LOOPS - 
 

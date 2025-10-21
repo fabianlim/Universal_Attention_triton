@@ -36,11 +36,7 @@ class UniversalAttention(Function):
             kvheads=kvheads,
         )
 
-        dY = dY.view(b, kvheads, -1, l, l).sum(2)
-        dK = dK.view(b, kvheads, -1, l, d).sum(2)
-        dV = dV.view(b, kvheads, -1, l, d).sum(2)
-
 
         # NOTE: missing one component of dK
         # - dY is the gradient for decay
-        return dK, dV, dQ, dY
+        return dK, dV, dQ, dY.view(b, kvheads, -1, l, l).sum(2)

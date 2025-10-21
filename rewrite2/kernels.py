@@ -57,12 +57,12 @@ def softmax_with_decay_fwd(
     res = torch.zeros(
         (b, nheads, qlen, vdim), 
         device=q.device, 
-        dtype=torch.float32
+        dtype=q.dtype,
     ) 
     res_attn = torch.zeros(
         (b, nheads, qlen, klen), 
         device=q.device, 
-        dtype=torch.float32
+        dtype=q.dtype,
     ) 
 
     # NOTE: dont really have a good solution
@@ -77,7 +77,7 @@ def softmax_with_decay_fwd(
             klen // smallest_block_c
         ), 
         device=q.device, 
-        dtype=torch.float32
+        dtype=q.dtype
     ) 
 
     _softmax_with_decay_fwd[grid](
@@ -416,13 +416,13 @@ def compute_dYdQ(
     res_dY = torch.zeros(
         (b, nheads, qlen, klen), 
         device=q.device, 
-        dtype=torch.float32
+        dtype=q.dtype,
     ) 
 
     res_dQ = torch.zeros(
         (b, nheads, qlen, qdim), 
         device=q.device, 
-        dtype=torch.float32
+        dtype=q.dtype
     ) 
 
     _compute_dYdQ[grid](
@@ -713,13 +713,13 @@ def compute_dVdK(
     res_dV = torch.zeros(
         (b, kvheads, dolen, vdim), 
         device=q.device, 
-        dtype=torch.float32
+        dtype=q.dtype,
     ) 
 
     res_dK = torch.zeros(
         (b, kvheads, dolen, qdim), # assume same
         device=q.device, 
-        dtype=torch.float32
+        dtype=q.dtype,
     ) 
 
     _compute_dVdK[grid](

@@ -3,8 +3,6 @@ import triton
 import triton.language as tl
 from itertools import product
 
-CHUNK_SIZE = 16
-
 SMALLEST_BLOCK_C = 16
 CONFIGS = [
     triton.Config({
@@ -710,16 +708,16 @@ def compute_dVdK(
     b, nheads, qlen, qdim = q.shape
     _, _, dolen, vdim = dout.shape
 
-    grid = lambda META: (b, nheads, triton.cdiv(dolen, META['chunk_size']))
+    grid = lambda META: (b, kvheads, triton.cdiv(dolen, META['chunk_size']))
 
     res_dV = torch.zeros(
-        (b, nheads, dolen, vdim), 
+        (b, kvheads, dolen, vdim), 
         device=q.device, 
         dtype=torch.float32
     ) 
 
     res_dK = torch.zeros(
-        (b, nheads, dolen, qdim), # assume same
+        (b, kvheads, dolen, qdim), # assume same
         device=q.device, 
         dtype=torch.float32
     ) 
@@ -768,17 +766,18 @@ def _compute_dVdK(
     HEAD_DIM: tl.constexpr,
 ):
     pid_b = tl.program_id(0) # batch
-    pid_h = tl.program_id(1) # query head
-    hkv = pid_h // group_size # key / value head
+    hkv = tl.program_id(1) # kv head
     pid_c = tl.program_id(2) # col chunk
 
     # offset by batch and head
-    res_dV += pid_b * res_dV_stride_b + pid_h * res_dV_stride_h
-    res_dK += pid_b * res_dK_stride_b + pid_h * res_dK_stride_h
-    dout += pid_b * do_stride_b + pid_h * do_stride_h
-    dY += pid_b * dY_stride_b + pid_h * dY_stride_h
-    attn += pid_b * attn_stride_b + pid_h * attn_stride_h
-    queries += pid_b * q_stride_b + hkv * q_stride_h
+    dout += pid_b * do_stride_b + hkv * group_size * do_stride_h
+    dY += pid_b * dY_stride_b + hkv * group_size * dY_stride_h
+    attn += pid_b * attn_stride_b + hkv * group_size * attn_stride_h
+    queries += pid_b * q_stride_b + hkv * group_size * q_stride_h
+
+    # - dep on kvhead
+    res_dV += pid_b * res_dV_stride_b + hkv * res_dV_stride_h
+    res_dK += pid_b * res_dK_stride_b + hkv * res_dK_stride_h
 
     # columns
     dout_r = dout + pid_c * chunk_size * do_stride_seq
@@ -814,60 +813,66 @@ def _compute_dVdK(
     # process the rows
     for r in range(0, nR):
 
-        dot_mat = tl.load(
-            (
-                dout_r 
-                + offs_v[:, None] * do_stride_dim # NOTE: assumed same
-                + offs_i[None, :] * do_stride_seq
-            ),
-            mask=(offs_i[None, :] < limit_r),
-            other=0.0
-        ).to(tl.float32)
+        for i in range(0, group_size):
 
-        attn_mat = tl.load(
-            (
-                attn_c 
-                + offs_i[:, None] * attn_stride_qseq
-                + offs_j[None, :] * attn_stride_kseq
-            ),
-            mask=(
-                (offs_i[:, None] < limit_r) &
-                (offs_j[None, :] < limit_c)
-            ),
-            other=0.0
-        ).to(tl.float32)
+            dot_mat = tl.load(
+                (
+                    dout_r 
+                    + i * do_stride_h
+                    + offs_v[:, None] * do_stride_dim # NOTE: assumed same
+                    + offs_i[None, :] * do_stride_seq
+                ),
+                mask=(offs_i[None, :] < limit_r),
+                other=0.0
+            ).to(tl.float32)
 
-        # dV
-        # - score should have zeros in appropriate places
-        acc2 += tl.dot(dot_mat, attn_mat)
+            attn_mat = tl.load(
+                (
+                    attn_c 
+                    + i * attn_stride_h
+                    + offs_i[:, None] * attn_stride_qseq
+                    + offs_j[None, :] * attn_stride_kseq
+                ),
+                mask=(
+                    (offs_i[:, None] < limit_r) &
+                    (offs_j[None, :] < limit_c)
+                ),
+                other=0.0
+            ).to(tl.float32)
 
-        qt_mat = tl.load(
-            (
-                queries_r
-                + offs_v[:, None] * q_stride_dim # NOTE: assumed same
-                + offs_i[None, :] * q_stride_seq
-            ),
-            mask=(offs_i[None, :] < limit_r),
-            other=0.0
-        ).to(tl.float32)
+            # dV
+            # - score should have zeros in appropriate places
+            acc2 += tl.dot(dot_mat, attn_mat)
 
-        dY_mat = tl.load(
-            (
-                dY_c 
-                + offs_i[:, None] * dY_stride_qseq
-                + offs_j[None, :] * dY_stride_kseq
-            ),
-            mask=(
-                (offs_i[:, None] < limit_r) &
-                (offs_j[None, :] < limit_c)
-            ),
-            other=0.0
-        ).to(tl.float32)
+            qt_mat = tl.load(
+                (
+                    queries_r
+                    + i * q_stride_h
+                    + offs_v[:, None] * q_stride_dim # NOTE: assumed same
+                    + offs_i[None, :] * q_stride_seq
+                ),
+                mask=(offs_i[None, :] < limit_r),
+                other=0.0
+            ).to(tl.float32)
 
-        # dK
-        # - score (and therefore dZScore) should have
-        #   zeros in appropriate places
-        acc += tl.dot(qt_mat, dY_mat)
+            dY_mat = tl.load(
+                (
+                    dY_c 
+                    + i * dY_stride_h
+                    + offs_i[:, None] * dY_stride_qseq
+                    + offs_j[None, :] * dY_stride_kseq
+                ),
+                mask=(
+                    (offs_i[:, None] < limit_r) &
+                    (offs_j[None, :] < limit_c)
+                ),
+                other=0.0
+            ).to(tl.float32)
+
+            # dK
+            # - score (and therefore dZScore) should have
+            #   zeros in appropriate places
+            acc += tl.dot(qt_mat, dY_mat)
 
         # movements
         queries_r += BLOCK_R * q_stride_seq
@@ -877,11 +882,6 @@ def _compute_dVdK(
 
         # handle the limit
         limit_r -= BLOCK_R
-
-    
-    # if pid_b == 0 and pid_h == 0 and pid_c == 2:
-    # if pid_b == 0 and pid_h == 0 and pid_c == 1:
-    #     print ("acc2", acc2)
 
     # -  DONE WITH ROW CHUNK LOOPS - 
 
